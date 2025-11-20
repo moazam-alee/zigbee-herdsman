@@ -59,7 +59,7 @@ const CONFIG_IDS_PRE_V9: number[][] = [
     ],
     [EzspConfigId.CONFIG_INDIRECT_TRANSMISSION_TIMEOUT, 7680],
     [EzspConfigId.CONFIG_END_DEVICE_POLL_TIMEOUT, 14],
-    [EzspConfigId.CONFIG_SECURITY_LEVEL, 5],
+    [EzspConfigId.CONFIG_SECURITY_LEVEL, 0],
     [EzspConfigId.CONFIG_STACK_PROFILE, 2],
     //[EzspConfigId.CONFIG_TX_POWER_MODE, 3],
     [EzspConfigId.CONFIG_FRAGMENT_WINDOW_SIZE, 1],
@@ -91,7 +91,7 @@ const CONFIG_IDS_CURRENT: number[][] = [
     ],
     [EzspConfigId.CONFIG_INDIRECT_TRANSMISSION_TIMEOUT, 7680],
     [EzspConfigId.CONFIG_END_DEVICE_POLL_TIMEOUT, 14],
-    [EzspConfigId.CONFIG_SECURITY_LEVEL, 5],
+    [EzspConfigId.CONFIG_SECURITY_LEVEL, 0],
     [EzspConfigId.CONFIG_STACK_PROFILE, 2],
     [EzspConfigId.CONFIG_FRAGMENT_WINDOW_SIZE, 1],
 ];
