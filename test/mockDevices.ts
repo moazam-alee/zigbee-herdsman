@@ -92,6 +92,7 @@ export const MOCK_DEVICES: {
         simpleDescriptor?: {[key: number]: ZdoTypes.ResponseMap[Zdo.ClusterId.SIMPLE_DESCRIPTOR_RESPONSE] | undefined};
         lqiTable?: ZdoTypes.ResponseMap[Zdo.ClusterId.LQI_TABLE_RESPONSE];
         routingTable?: ZdoTypes.ResponseMap[Zdo.ClusterId.ROUTING_TABLE_RESPONSE];
+        bindingTable?: ZdoTypes.ResponseMap[Zdo.ClusterId.BINDING_TABLE_REQUEST];
         attributes?: {[key: number]: {[key: string]: unknown}};
         key?: "xiaomi";
     };
@@ -155,6 +156,30 @@ export const MOCK_DEVICES: {
                 entryList: [
                     {...ROUTING_TABLE_ENTRY_DEFAULTS, destinationAddress: 120, status: "ACTIVE", nextHopAddress: 1},
                     {...ROUTING_TABLE_ENTRY_DEFAULTS, destinationAddress: 130, status: "DISCOVERY_FAILED", nextHopAddress: 2},
+                ],
+            },
+        ],
+        bindingTable: [
+            Zdo.Status.SUCCESS,
+            {
+                bindingTableEntries: 2,
+                startIndex: 0,
+                entryList: [
+                    {
+                        sourceEui64: "0xf1f2f3f5f6f7f8",
+                        sourceEndpoint: 1,
+                        clusterId: Zcl.Clusters.genBasic.ID,
+                        destAddrMode: 0x03,
+                        dest: "0xa1a2a3a4a5a6a7a8",
+                        destEndpoint: 2,
+                    },
+                    {
+                        sourceEui64: "0xe1e2e3e5e6e7e8",
+                        sourceEndpoint: 3,
+                        clusterId: Zcl.Clusters.genAlarms.ID,
+                        destAddrMode: 0x01,
+                        dest: 0x1234,
+                    },
                 ],
             },
         ],
@@ -509,7 +534,7 @@ export const MOCK_DEVICES: {
         },
         attributes: {
             1: {
-                modelId: " some other multi-endpoint device",
+                modelId: " other multi-endpoint device",
                 manufacturerName: "Legrand",
                 zclVersion: 2,
                 appVersion: 0,
@@ -594,5 +619,28 @@ export const MOCK_DEVICES: {
                 stackVersion: 67,
             },
         },
+    },
+    180: {
+        // Control4 keypad dimmer: the node descriptor identifies it (manufacturerCode 0xabcd), but the
+        // device does not answer genBasic reads and the simple descriptor request for its proprietary
+        // endpoint times out, so the interview fails partway through.
+        nodeDescriptor: [Zdo.Status.SUCCESS, {...NODE_DESC_DEFAULTS, nwkAddress: 180, logicalType: 0b001, manufacturerCode: 0xabcd}],
+        activeEndpoints: [Zdo.Status.SUCCESS, {nwkAddress: 180, endpointList: [1, 197]}],
+        simpleDescriptor: {
+            1: [
+                Zdo.Status.SUCCESS,
+                {
+                    nwkAddress: 180,
+                    length: 14,
+                    endpoint: 1,
+                    profileId: 260,
+                    deviceId: 257,
+                    deviceVersion: 1,
+                    inClusterList: [0, 6, 8],
+                    outClusterList: [],
+                },
+            ],
+        },
+        attributes: {},
     },
 };

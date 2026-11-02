@@ -8,36 +8,24 @@ import * as ZSpec from "../../../zspec";
 import * as Zcl from "../../../zspec/zcl";
 import * as Zdo from "../../../zspec/zdo";
 import type * as ZdoTypes from "../../../zspec/zdo/definition/tstypes";
-import {Adapter, type TsType} from "../..";
+import {Adapter, type ClusterWaitressMatcher, type ZclWaitressPayload} from "../../adapter";
 import {WORKAROUND_JOIN_MANUF_IEEE_PREFIX_TO_CODE} from "../../const";
 import type {ZclPayload} from "../../events";
+import type {AdapterOptions, CoordinatorVersion, NetworkOptions, NetworkParameters, StartResult, TransportOptions} from "../../tstype";
 import {ZBOSSDriver} from "../driver";
 import {CommandId, DeviceUpdateStatus} from "../enums";
 import {FrameType, type ZBOSSFrame} from "../frame";
 
 const NS = "zh:zboss";
 
-interface WaitressMatcher {
-    address: number | string;
-    endpoint: number;
-    transactionSequenceNumber?: number;
-    clusterID: number;
-    commandIdentifier: number;
-}
-
 export class ZBOSSAdapter extends Adapter {
     private queue: Queue;
     private readonly driver: ZBOSSDriver;
-    private waitress: Waitress<ZclPayload, WaitressMatcher>;
+    private waitress: Waitress<ZclWaitressPayload, ClusterWaitressMatcher>;
     private currentManufacturerCode: Zcl.ManufacturerCode;
 
-    constructor(
-        networkOptions: TsType.NetworkOptions,
-        serialPortOptions: TsType.SerialPortOptions,
-        backupPath: string,
-        adapterOptions: TsType.AdapterOptions,
-    ) {
-        super(networkOptions, serialPortOptions, backupPath, adapterOptions);
+    constructor(networkOptions: NetworkOptions, transportOptions: TransportOptions, backupPath: string, adapterOptions: AdapterOptions) {
+        super(networkOptions, transportOptions, backupPath, adapterOptions);
         this.hasZdoMessageOverhead = false;
         this.manufacturerID = Zcl.ManufacturerCode.NORDIC_SEMICONDUCTOR_ASA;
         this.currentManufacturerCode = Zcl.ManufacturerCode.NORDIC_SEMICONDUCTOR_ASA;
@@ -45,8 +33,8 @@ export class ZBOSSAdapter extends Adapter {
         logger.debug(`Adapter concurrent: ${concurrent}`, NS);
         this.queue = new Queue(concurrent);
 
-        this.waitress = new Waitress<ZclPayload, WaitressMatcher>(this.waitressValidator, this.waitressTimeoutFormatter);
-        this.driver = new ZBOSSDriver(serialPortOptions, networkOptions);
+        this.waitress = new Waitress(Adapter.zclWaitressValidator, Adapter.clusterWaitressTimeoutFormatter);
+        this.driver = new ZBOSSDriver(this.transport, networkOptions);
         this.driver.on("frame", this.processMessage.bind(this));
     }
 
@@ -107,7 +95,10 @@ export class ZBOSSAdapter extends Adapter {
                         destinationEndpoint: frame.payload.dstEndpoint,
                     };
 
-                    this.waitress.resolve(payload);
+                    if (payload.header !== undefined) {
+                        this.waitress.resolve(payload as ZclWaitressPayload);
+                    }
+
                     this.emit("zclPayload", payload);
                     break;
                 }
@@ -115,7 +106,7 @@ export class ZBOSSAdapter extends Adapter {
         }
     }
 
-    public async start(): Promise<TsType.StartResult> {
+    public async start(): Promise<StartResult> {
         logger.info("ZBOSS Adapter starting", NS);
 
         await this.driver.connect();
@@ -133,8 +124,8 @@ export class ZBOSSAdapter extends Adapter {
         return await Promise.resolve(this.driver.netInfo.ieeeAddr);
     }
 
-    public async getCoordinatorVersion(): Promise<TsType.CoordinatorVersion> {
-        return await this.queue.execute<TsType.CoordinatorVersion>(async () => {
+    public async getCoordinatorVersion(): Promise<CoordinatorVersion> {
+        return await this.queue.execute<CoordinatorVersion>(async () => {
             const ver = await this.driver.execCommand(CommandId.GET_MODULE_VERSION, {});
             const cver = await this.driver.execCommand(CommandId.GET_COORDINATOR_VERSION, {});
             const ver2str = (version: number): string => {
@@ -169,7 +160,7 @@ export class ZBOSSAdapter extends Adapter {
         return await Promise.reject(new Error("This adapter does not support backup"));
     }
 
-    public async getNetworkParameters(): Promise<TsType.NetworkParameters> {
+    public async getNetworkParameters(): Promise<NetworkParameters> {
         return await this.queue.execute(async () => {
             // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
             const channel = this.driver.netInfo!.network.channel;
@@ -193,40 +184,38 @@ export class ZBOSSAdapter extends Adapter {
     }
 
     public async permitJoin(seconds: number, networkAddress?: number): Promise<void> {
-        if (this.driver.isInitialized()) {
-            if (this.currentManufacturerCode !== this.manufacturerID) {
-                logger.debug(`[WORKAROUND] Resetting coordinator manufacturer code to ${Zcl.ManufacturerCode[this.manufacturerID]}.`, NS);
+        if (this.currentManufacturerCode !== this.manufacturerID) {
+            logger.debug(`[WORKAROUND] Resetting coordinator manufacturer code to ${Zcl.ManufacturerCode[this.manufacturerID]}.`, NS);
 
-                await this.driver.execCommand(CommandId.ZDO_SET_NODE_DESC_MANUF_CODE, {manufacturerCode: this.manufacturerID});
+            await this.driver.execCommand(CommandId.ZDO_SET_NODE_DESC_MANUF_CODE, {manufacturerCode: this.manufacturerID});
 
-                this.currentManufacturerCode = this.manufacturerID;
+            this.currentManufacturerCode = this.manufacturerID;
+        }
+
+        const clusterId = Zdo.ClusterId.PERMIT_JOINING_REQUEST;
+        // `authentication`: TC significance always 1 (zb specs)
+        const zdoPayload = Zdo.Buffalo.buildRequest(this.hasZdoMessageOverhead, clusterId, seconds, 1, []);
+
+        if (networkAddress) {
+            // `device-only`
+            const result = await this.sendZdo(ZSpec.BLANK_EUI64, networkAddress, clusterId, zdoPayload, false);
+
+            if (!Zdo.Buffalo.checkStatus<Zdo.ClusterId.PERMIT_JOINING_RESPONSE>(result)) {
+                // TODO: will disappear once moved upstream
+                throw new Zdo.StatusError(result[0]);
+            }
+        } else {
+            // `coordinator-only` (for `all` too)
+            const result = await this.sendZdo(ZSpec.BLANK_EUI64, ZSpec.COORDINATOR_ADDRESS, clusterId, zdoPayload, false);
+
+            if (!Zdo.Buffalo.checkStatus<Zdo.ClusterId.PERMIT_JOINING_RESPONSE>(result)) {
+                // TODO: will disappear once moved upstream
+                throw new Zdo.StatusError(result[0]);
             }
 
-            const clusterId = Zdo.ClusterId.PERMIT_JOINING_REQUEST;
-            // `authentication`: TC significance always 1 (zb specs)
-            const zdoPayload = Zdo.Buffalo.buildRequest(this.hasZdoMessageOverhead, clusterId, seconds, 1, []);
-
-            if (networkAddress) {
-                // `device-only`
-                const result = await this.sendZdo(ZSpec.BLANK_EUI64, networkAddress, clusterId, zdoPayload, false);
-
-                if (!Zdo.Buffalo.checkStatus<Zdo.ClusterId.PERMIT_JOINING_RESPONSE>(result)) {
-                    // TODO: will disappear once moved upstream
-                    throw new Zdo.StatusError(result[0]);
-                }
-            } else {
-                // `coordinator-only` (for `all` too)
-                const result = await this.sendZdo(ZSpec.BLANK_EUI64, ZSpec.COORDINATOR_ADDRESS, clusterId, zdoPayload, false);
-
-                if (!Zdo.Buffalo.checkStatus<Zdo.ClusterId.PERMIT_JOINING_RESPONSE>(result)) {
-                    // TODO: will disappear once moved upstream
-                    throw new Zdo.StatusError(result[0]);
-                }
-
-                if (networkAddress === undefined) {
-                    // `all`: broadcast
-                    await this.sendZdo(ZSpec.BLANK_EUI64, ZSpec.BroadcastAddress.DEFAULT, clusterId, zdoPayload, true);
-                }
+            if (networkAddress === undefined) {
+                // `all`: broadcast
+                await this.sendZdo(ZSpec.BLANK_EUI64, ZSpec.BroadcastAddress.DEFAULT, clusterId, zdoPayload, true);
             }
         }
     }
@@ -362,6 +351,7 @@ export class ZBOSSAdapter extends Adapter {
                 zclFrame.cluster.ID,
                 // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
                 command.response!,
+                undefined,
                 timeout,
             );
         } else if (!zclFrame.header.frameControl.disableDefaultResponse) {
@@ -371,6 +361,7 @@ export class ZBOSSAdapter extends Adapter {
                 zclFrame.header.transactionSequenceNumber,
                 zclFrame.cluster.ID,
                 Zcl.Foundation.defaultRsp.ID,
+                undefined,
                 timeout,
             );
         }
@@ -464,8 +455,12 @@ export class ZBOSSAdapter extends Adapter {
         return;
     }
 
-    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number): Promise<ZclPayload> {
-        return await Promise.reject(new Error(`NOT SUPPORTED: sendZclFrameInterPANBroadcast(${JSON.stringify(zclFrame)},${timeout})`));
+    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number, disableResponse: false): Promise<ZclPayload>;
+    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number, disableResponse: true): Promise<undefined>;
+    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number, disableResponse: boolean): Promise<ZclPayload | undefined> {
+        return await Promise.reject(
+            new Error(`NOT SUPPORTED: sendZclFrameInterPANBroadcast(${JSON.stringify(zclFrame)},${timeout},${disableResponse})`),
+        );
     }
 
     public async restoreChannelInterPAN(): Promise<void> {
@@ -476,18 +471,13 @@ export class ZBOSSAdapter extends Adapter {
         networkAddress: number,
         endpoint: number,
         transactionSequenceNumber: number | undefined,
-        clusterID: number,
-        commandIdentifier: number,
+        clusterId: number,
+        commandId: number,
+        defaultRspCommandId: number | undefined,
         timeout: number,
     ): {start: () => {promise: Promise<ZclPayload>}; cancel: () => void} {
         const waiter = this.waitress.waitFor(
-            {
-                address: networkAddress,
-                endpoint,
-                clusterID,
-                commandIdentifier,
-                transactionSequenceNumber,
-            },
+            {address: networkAddress, endpoint, clusterId, commandId, defaultRspCommandId, transactionSequenceNumber},
             timeout,
         );
         const cancel = (): void => this.waitress.remove(waiter.ID);
@@ -500,32 +490,13 @@ export class ZBOSSAdapter extends Adapter {
         _frameType: Zcl.FrameType,
         _direction: Zcl.Direction,
         transactionSequenceNumber: number | undefined,
-        clusterID: number,
-        commandIdentifier: number,
+        clusterId: number,
+        commandId: number,
+        defaultRspCommandId: number | undefined,
         timeout: number,
     ): {promise: Promise<ZclPayload>; cancel: () => void} {
-        const waiter = this.waitForInternal(networkAddress, endpoint, transactionSequenceNumber, clusterID, commandIdentifier, timeout);
+        const waiter = this.waitForInternal(networkAddress, endpoint, transactionSequenceNumber, clusterId, commandId, defaultRspCommandId, timeout);
 
         return {cancel: waiter.cancel, promise: waiter.start().promise};
-    }
-
-    private waitressTimeoutFormatter(matcher: WaitressMatcher, timeout: number): string {
-        return (
-            `Timeout - ${matcher.address} - ${matcher.endpoint}` +
-            ` - ${matcher.transactionSequenceNumber} - ${matcher.clusterID}` +
-            ` - ${matcher.commandIdentifier} after ${timeout}ms`
-        );
-    }
-
-    private waitressValidator(payload: ZclPayload, matcher: WaitressMatcher): boolean {
-        return (
-            (payload.header &&
-                (!matcher.address || payload.address === matcher.address) &&
-                payload.endpoint === matcher.endpoint &&
-                (matcher.transactionSequenceNumber === undefined || payload.header.transactionSequenceNumber === matcher.transactionSequenceNumber) &&
-                payload.clusterID === matcher.clusterID &&
-                matcher.commandIdentifier === payload.header.commandIdentifier) ||
-            false
-        );
     }
 }

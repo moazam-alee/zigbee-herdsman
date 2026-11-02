@@ -12,7 +12,7 @@ const cachedTimeData: Pick<TClusterAttributes<"genTime">, "timeZone" | "dstStart
     validUntilTime: 0,
 };
 
-function timestampToZigbeeUtcTime(timestamp: number) {
+export function timestampToZigbeeUtcTime(timestamp: number) {
     return timestamp === 0xffffffff ? timestamp : Math.round((timestamp - OneJanuary2000) / 1000);
 }
 
@@ -122,8 +122,8 @@ export function getTimeClusterAttributes(): TClusterAttributes<"genTime"> {
         dstStart: cachedTimeData.dstStart,
         dstEnd: cachedTimeData.dstEnd,
         dstShift: cachedTimeData.dstShift,
-        standardTime: standardTime,
-        localTime: localTime,
+        standardTime,
+        localTime,
         lastSetTime: currentZigbeeUtcTime,
         validUntilTime: cachedTimeData.validUntilTime,
     };

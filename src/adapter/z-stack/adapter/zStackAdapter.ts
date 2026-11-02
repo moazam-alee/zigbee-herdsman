@@ -1,7 +1,5 @@
 import assert from "node:assert";
-
 import debounce from "debounce";
-
 import type * as Models from "../../../models";
 import {Queue, Waitress, wait} from "../../../utils";
 import {logger} from "../../../utils/logger";
@@ -11,9 +9,9 @@ import type {Eui64} from "../../../zspec/tstypes";
 import * as Zcl from "../../../zspec/zcl";
 import * as Zdo from "../../../zspec/zdo";
 import type * as ZdoTypes from "../../../zspec/zdo/definition/tstypes";
-import Adapter from "../../adapter";
+import Adapter, {type ClusterWaitressMatcher, type ZclWaitressPayload} from "../../adapter";
 import type * as Events from "../../events";
-import type {AdapterOptions, CoordinatorVersion, NetworkOptions, NetworkParameters, SerialPortOptions, StartResult} from "../../tstype";
+import type {AdapterOptions, CoordinatorVersion, NetworkOptions, NetworkParameters, StartResult, TransportOptions} from "../../tstype";
 import * as Constants from "../constants";
 import {Constants as UnpiConstants} from "../unpi";
 import {Znp, type ZpiObject} from "../znp";
@@ -29,30 +27,12 @@ const Type = UnpiConstants.Type;
 const {ZnpCommandStatus, AddressMode} = Constants.COMMON;
 
 const DataConfirmTimeout = 9999; // Not an actual code
-const DataConfirmErrorCodeLookup: {[k: number]: string} = {
-    [DataConfirmTimeout]: "Timeout",
-    26: "MAC no resources",
-    183: "APS no ack",
-    205: "No network route",
-    225: "MAC channel access failure",
-    233: "MAC no ack",
-    240: "MAC transaction expired",
-};
-
-interface WaitressMatcher {
-    address?: number | string;
-    endpoint: number;
-    transactionSequenceNumber?: number;
-    frameType: Zcl.FrameType;
-    clusterID: number;
-    commandIdentifier: number;
-    direction: number;
-}
 
 class DataConfirmError extends Error {
     public code: number;
     constructor(code: number) {
-        const message = `Data request failed with error: '${DataConfirmErrorCodeLookup[code]}' (${code})`;
+        const error = code === DataConfirmTimeout ? "'TIMEOUT'" : `'${ZnpCommandStatus[code]}' (0x${code.toString(16)})`;
+        const message = `Data request failed with error: ${error}`;
         super(message);
         this.code = code;
     }
@@ -73,30 +53,26 @@ export class ZStackAdapter extends Adapter {
         maintrel: number;
         revision: string;
     };
-    private closing: boolean;
     // @ts-expect-error initialized in `start`
     private queue: Queue;
     private supportsLED?: boolean;
     private interpanLock: boolean;
     private interpanEndpointRegistered: boolean;
-    private waitress: Waitress<Events.ZclPayload, WaitressMatcher>;
+    private waitress: Waitress<ZclWaitressPayload, ClusterWaitressMatcher>;
 
-    public constructor(networkOptions: NetworkOptions, serialPortOptions: SerialPortOptions, backupPath: string, adapterOptions: AdapterOptions) {
-        super(networkOptions, serialPortOptions, backupPath, adapterOptions);
+    public constructor(networkOptions: NetworkOptions, transportOptions: TransportOptions, backupPath: string, adapterOptions: AdapterOptions) {
+        super(networkOptions, transportOptions, backupPath, adapterOptions);
         this.hasZdoMessageOverhead = false;
         this.manufacturerID = Zcl.ManufacturerCode.TEXAS_INSTRUMENTS;
-        // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-        this.znp = new Znp(this.serialPortOptions.path!, this.serialPortOptions.baudRate!, this.serialPortOptions.rtscts!);
+        this.znp = new Znp(this.transport);
 
         this.transactionID = 0;
         this.deviceAnnounceRouteDiscoveryDebouncers = new Map();
         this.interpanLock = false;
         this.interpanEndpointRegistered = false;
-        this.closing = false;
-        this.waitress = new Waitress<Events.ZclPayload, WaitressMatcher>(this.waitressValidator, this.waitressTimeoutFormatter);
+        this.waitress = new Waitress(Adapter.zclWaitressValidator, Adapter.clusterWaitressTimeoutFormatter);
 
         this.znp.on("received", this.onZnpRecieved.bind(this));
-        this.znp.on("close", this.onZnpClose.bind(this));
     }
 
     /**
@@ -131,7 +107,7 @@ export class ZStackAdapter extends Adapter {
 
         this.queue = new Queue(concurrent);
 
-        logger.debug(`Detected znp version '${ZnpVersion[this.version.product]}' (${JSON.stringify(this.version)})`, NS);
+        logger.debug(() => `Detected znp version '${ZnpVersion[this.version.product]}' (${JSON.stringify(this.version)})`, NS);
         this.adapterManager = new ZnpAdapterManager(this, this.znp, {
             backupPath: this.backupPath,
             version: this.version.product,
@@ -156,7 +132,6 @@ export class ZStackAdapter extends Adapter {
     }
 
     public async stop(): Promise<void> {
-        this.closing = true;
         await this.znp.close();
     }
 
@@ -181,7 +156,6 @@ export class ZStackAdapter extends Adapter {
         if (networkAddress === undefined) {
             await this.sendZdo(ZSpec.BLANK_EUI64, ZSpec.BroadcastAddress.DEFAULT, clusterId, zdoPayload, true);
         } else {
-            // NOTE: `sendZdo` takes care of adjusting the payload as appropriate based on `networkAddress === 0` or not
             const result = await this.sendZdo(ZSpec.BLANK_EUI64, networkAddress, clusterId, zdoPayload, false);
 
             /* v8 ignore start */
@@ -383,8 +357,9 @@ export class ZStackAdapter extends Adapter {
                 case Zdo.ClusterId.PERMIT_JOINING_REQUEST: {
                     const finalPayload = Buffer.alloc(payload.length + 3);
                     finalPayload.writeUInt8(ZSpec.BroadcastAddress[networkAddress] ? AddressMode.ADDR_BROADCAST : AddressMode.ADDR_16BIT, 0);
-                    // zstack uses AddressMode.ADDR_16BIT + ZSpec.BroadcastAddress.DEFAULT to signal "coordinator-only"
-                    finalPayload.writeUInt16LE(networkAddress === 0 ? ZSpec.BroadcastAddress.DEFAULT : networkAddress, 1);
+                    // TI treats broadcast destinations as broadcast even in 16-bit address mode, so preserve 0x0000 for coordinator-only joining.
+                    // https://github.com/TexasInstruments/simplelink-lowpower-f2-sdk/blob/lpf2-8.30.01.01/source/ti/zstack/stack/zdo/zd_profile.c#L1413-L1441
+                    finalPayload.writeUInt16LE(networkAddress, 1);
                     finalPayload.set(payload, 3);
 
                     payload = finalPayload;
@@ -535,22 +510,20 @@ export class ZStackAdapter extends Adapter {
             response = this.waitForInternal(
                 networkAddress,
                 endpoint,
-                zclFrame.header.frameControl.frameType,
-                Zcl.Direction.SERVER_TO_CLIENT,
                 zclFrame.header.transactionSequenceNumber,
                 zclFrame.cluster.ID,
                 command.response,
+                undefined,
                 timeout,
             );
         } else if (!zclFrame.header.frameControl.disableDefaultResponse) {
             response = this.waitForInternal(
                 networkAddress,
                 endpoint,
-                Zcl.FrameType.GLOBAL,
-                Zcl.Direction.SERVER_TO_CLIENT,
                 zclFrame.header.transactionSequenceNumber,
                 zclFrame.cluster.ID,
                 Zcl.Foundation.defaultRsp.ID,
+                undefined,
                 timeout,
             );
         }
@@ -835,12 +808,6 @@ export class ZStackAdapter extends Adapter {
     /**
      * Event handlers
      */
-    public onZnpClose(): void {
-        if (!this.closing) {
-            this.emit("disconnected");
-        }
-    }
-
     private onZnpRecieved(object: ZpiObject): void {
         if (object.type !== UnpiConstants.Type.AREQ) {
             return;
@@ -871,9 +838,11 @@ export class ZStackAdapter extends Adapter {
                             // to rediscover the route every time.
                             const debouncer = debounce(
                                 () => {
-                                    this.queue.execute<void>(async () => {
-                                        await this.discoverRoute(zdoPayload.nwkAddress, false).catch(() => {});
-                                    }, zdoPayload.nwkAddress);
+                                    this.queue
+                                        .execute<void>(async () => {
+                                            await this.discoverRoute(zdoPayload.nwkAddress, false).catch(() => {});
+                                        }, zdoPayload.nwkAddress)
+                                        .catch(() => {});
                                 },
                                 60 * 1000,
                                 {immediate: true},
@@ -960,30 +929,36 @@ export class ZStackAdapter extends Adapter {
                         // must be retrieved block by block from the ZNP buffer using the
                         // AF_DATA_RETRIEVE message.
 
-                        this.queue.execute<void>(async () => {
-                            const data = await this.dataRetrieveAll(object.payload.timestamp, object.payload.len);
-                            if (data === undefined) {
-                                logger.error("Failed to retrieve chunked payload for incomingMsgExt", NS);
-                            } else {
-                                logger.debug(
-                                    `Retrieved ${data.length} bytes from huge data buffer for msg with timestamp ${object.payload.timestamp}`,
-                                    NS,
-                                );
-                                const payload: Events.ZclPayload = {
-                                    clusterID: object.payload.clusterid,
-                                    data: data,
-                                    header: Zcl.Header.fromBuffer(data),
-                                    address: srcaddr,
-                                    endpoint: object.payload.srcendpoint,
-                                    linkquality: object.payload.linkquality,
-                                    groupID: object.payload.groupid,
-                                    wasBroadcast: object.payload.wasbroadcast === 1,
-                                    destinationEndpoint: object.payload.dstendpoint,
-                                };
-                                this.waitress.resolve(payload);
-                                this.emit("zclPayload", payload);
-                            }
-                        });
+                        this.queue
+                            .execute<void>(async () => {
+                                const data = await this.dataRetrieveAll(object.payload.timestamp, object.payload.len);
+                                if (data === undefined) {
+                                    logger.error("Failed to retrieve chunked payload for incomingMsgExt", NS);
+                                } else {
+                                    logger.debug(
+                                        `Retrieved ${data.length} bytes from huge data buffer for msg with timestamp ${object.payload.timestamp}`,
+                                        NS,
+                                    );
+                                    const payload: Events.ZclPayload = {
+                                        clusterID: object.payload.clusterid,
+                                        data: data,
+                                        header: Zcl.Header.fromBuffer(data),
+                                        address: srcaddr,
+                                        endpoint: object.payload.srcendpoint,
+                                        linkquality: object.payload.linkquality,
+                                        groupID: object.payload.groupid,
+                                        wasBroadcast: object.payload.wasbroadcast === 1,
+                                        destinationEndpoint: object.payload.dstendpoint,
+                                    };
+
+                                    if (payload.header !== undefined) {
+                                        this.waitress.resolve(payload as ZclWaitressPayload);
+                                    }
+
+                                    this.emit("zclPayload", payload);
+                                }
+                            })
+                            .catch(() => {});
                     } else {
                         // incomingMsg OR incomingMsgExt with data
                         // in the payload (i.e. INTER_PAN network)
@@ -1000,7 +975,10 @@ export class ZStackAdapter extends Adapter {
                             destinationEndpoint: object.payload.dstendpoint,
                         };
 
-                        this.waitress.resolve(payload);
+                        if (payload.header !== undefined) {
+                            this.waitress.resolve(payload as ZclWaitressPayload);
+                        }
+
                         this.emit("zclPayload", payload);
                     }
                 }
@@ -1062,23 +1040,24 @@ export class ZStackAdapter extends Adapter {
         });
     }
 
-    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number): Promise<Events.ZclPayload> {
-        return await this.queue.execute<Events.ZclPayload>(async () => {
+    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number, disableResponse: false): Promise<Events.ZclPayload>;
+    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number, disableResponse: true): Promise<undefined>;
+    public async sendZclFrameInterPANBroadcast(
+        zclFrame: Zcl.Frame,
+        timeout: number,
+        disableResponse: boolean,
+    ): Promise<Events.ZclPayload | undefined> {
+        return await this.queue.execute<Events.ZclPayload | undefined>(async () => {
             const command = zclFrame.command;
-            if (command.response === undefined) {
+            if (!disableResponse && command.response === undefined) {
                 throw new Error(`Command '${command.name}' has no response, cannot wait for response`);
             }
 
-            const response = this.waitForInternal(
-                undefined,
-                0xfe,
-                zclFrame.header.frameControl.frameType,
-                Zcl.Direction.SERVER_TO_CLIENT,
-                undefined,
-                zclFrame.cluster.ID,
-                command.response,
-                timeout,
-            );
+            let response: ReturnType<typeof this.waitForInternal> | undefined;
+
+            if (!disableResponse && command.response !== undefined) {
+                response = this.waitForInternal(undefined, 0xfe, undefined, zclFrame.cluster.ID, command.response, undefined, timeout);
+            }
 
             try {
                 await this.dataRequestExtended(
@@ -1094,11 +1073,13 @@ export class ZStackAdapter extends Adapter {
                     false,
                 );
             } catch (error) {
-                response.cancel();
+                response?.cancel();
                 throw error;
             }
 
-            return await response.start().promise;
+            if (response) {
+                return await response.start().promise;
+            }
         });
     }
 
@@ -1114,22 +1095,13 @@ export class ZStackAdapter extends Adapter {
     private waitForInternal(
         networkAddress: number | undefined,
         endpoint: number,
-        frameType: Zcl.FrameType,
-        direction: Zcl.Direction,
         transactionSequenceNumber: number | undefined,
-        clusterID: number,
-        commandIdentifier: number,
+        clusterId: number,
+        commandId: number,
+        defaultRspCommandId: number | undefined,
         timeout: number,
     ): {start: () => {promise: Promise<Events.ZclPayload>}; cancel: () => void} {
-        const payload = {
-            address: networkAddress,
-            endpoint,
-            clusterID,
-            commandIdentifier,
-            frameType,
-            direction,
-            transactionSequenceNumber,
-        };
+        const payload = {address: networkAddress, endpoint, clusterId, commandId, defaultRspCommandId, transactionSequenceNumber};
 
         const waiter = this.waitress.waitFor(payload, timeout);
         const cancel = (): void => this.waitress.remove(waiter.ID);
@@ -1137,25 +1109,17 @@ export class ZStackAdapter extends Adapter {
     }
 
     public waitFor(
-        networkAddress: number | undefined,
+        networkAddress: number,
         endpoint: number,
-        frameType: Zcl.FrameType,
-        direction: Zcl.Direction,
+        _frameType: Zcl.FrameType,
+        _direction: Zcl.Direction,
         transactionSequenceNumber: number | undefined,
-        clusterID: number,
-        commandIdentifier: number,
+        clusterId: number,
+        commandId: number,
+        defaultRspCommandId: number | undefined,
         timeout: number,
     ): {promise: Promise<Events.ZclPayload>; cancel: () => void} {
-        const waiter = this.waitForInternal(
-            networkAddress,
-            endpoint,
-            frameType,
-            direction,
-            transactionSequenceNumber,
-            clusterID,
-            commandIdentifier,
-            timeout,
-        );
+        const waiter = this.waitForInternal(networkAddress, endpoint, transactionSequenceNumber, clusterId, commandId, defaultRspCommandId, timeout);
 
         return {cancel: waiter.cancel, promise: waiter.start().promise};
     }
@@ -1175,6 +1139,13 @@ export class ZStackAdapter extends Adapter {
         const transactionID = this.nextTransactionID();
         const response = this.znp.waitFor(Type.AREQ, Subsystem.AF, "dataConfirm", undefined, transactionID, undefined, timeout);
 
+        let options = 0;
+
+        // Zigbee Direct cluster, enable APS layer encryption
+        if (clusterID === Zcl.Clusters.zigbeeDirectConfiguration.ID) {
+            options |= Constants.AF.options.EN_SECURITY;
+        }
+
         await this.znp.request(
             Subsystem.AF,
             "dataRequest",
@@ -1184,7 +1155,7 @@ export class ZStackAdapter extends Adapter {
                 srcendpoint: sourceEndpoint,
                 clusterid: clusterID,
                 transid: transactionID,
-                options: 0,
+                options,
                 radius: radius,
                 len: data.length,
                 data: data,
@@ -1288,27 +1259,6 @@ export class ZStackAdapter extends Adapter {
 
     private toAddressString(address: number | string): string {
         return typeof address === "number" ? `0x${address.toString(16).padStart(16, "0")}` : address.toString();
-    }
-
-    private waitressTimeoutFormatter(matcher: WaitressMatcher, timeout: number): string {
-        return (
-            `Timeout - ${matcher.address} - ${matcher.endpoint}` +
-            ` - ${matcher.transactionSequenceNumber} - ${matcher.clusterID}` +
-            ` - ${matcher.commandIdentifier} after ${timeout}ms`
-        );
-    }
-
-    private waitressValidator(payload: Events.ZclPayload, matcher: WaitressMatcher): boolean {
-        return Boolean(
-            payload.header &&
-                (!matcher.address || payload.address === matcher.address) &&
-                payload.endpoint === matcher.endpoint &&
-                (matcher.transactionSequenceNumber === undefined || payload.header.transactionSequenceNumber === matcher.transactionSequenceNumber) &&
-                payload.clusterID === matcher.clusterID &&
-                matcher.frameType === payload.header.frameControl.frameType &&
-                matcher.commandIdentifier === payload.header.commandIdentifier &&
-                matcher.direction === payload.header.frameControl.direction,
-        );
     }
 
     private checkInterpanLock(): void {

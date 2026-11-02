@@ -1,15 +1,14 @@
 /* v8 ignore start */
 
 import EventEmitter from "node:events";
-
-import {Queue} from "../../../utils";
+import {AsyncMutex} from "../../../utils/async-mutex";
 import {logger} from "../../../utils/logger";
 import * as ZSpec from "../../../zspec";
 import type {Eui64, ExtendedPanId, NodeId, PanId} from "../../../zspec/tstypes";
 import * as Zcl from "../../../zspec/zcl";
 import {Clusters} from "../../../zspec/zcl/definition/cluster";
 import * as Zdo from "../../../zspec/zdo";
-import type {SerialPortOptions} from "../../tstype";
+import type {AdapterTransport} from "../../transport";
 import {FIXED_ENDPOINTS} from "../adapter/endpoints";
 import {
     INTERPAN_APS_FRAME_CONTROL_NO_DELIVERY_MODE,
@@ -239,14 +238,14 @@ export class Ezsp extends EventEmitter<EmberEzspEventMap> {
     private frameSequence: number;
     /** Sequence used for EZSP send() tagging. static uint8_t */
     private sendSequence: number;
-    private readonly queue: Queue;
+    private readonly queue: AsyncMutex;
     /** Awaiting response resolve/timer struct. undefined if not waiting for response. */
     private responseWaiter?: EzspWaiter;
 
     /** Counter for Queue Full errors */
     public counterErrQueueFull: number;
 
-    constructor(options: SerialPortOptions) {
+    constructor(transport: AdapterTransport) {
         super();
 
         this.frameContents = Buffer.alloc(EZSP_MAX_FRAME_LENGTH);
@@ -254,8 +253,8 @@ export class Ezsp extends EventEmitter<EmberEzspEventMap> {
         this.callbackFrameContents = Buffer.alloc(EZSP_MAX_FRAME_LENGTH);
         this.callbackBuffalo = new EzspBuffalo(this.callbackFrameContents, 0);
 
-        this.queue = new Queue(1);
-        this.ash = new UartAsh(options);
+        this.queue = new AsyncMutex();
+        this.ash = new UartAsh(transport);
 
         this.version = 0;
         this.frameLength = 0;
@@ -349,14 +348,15 @@ export class Ezsp extends EventEmitter<EmberEzspEventMap> {
     }
 
     /**
-     * Triggered by @see 'FATAL_ERROR'
+     * Triggered by ASH layer @see 'fatalError'
      */
     private onAshFatalError(status: EzspStatus): void {
+        logger.error(`Fatal error, status=${EzspStatus[status]}. Last Frame: ${this.frameToString}`, NS);
         this.emit("ncpNeedsResetAndInit", status);
     }
 
     /**
-     * Triggered by @see 'FRAME'
+     * Triggered by ASH layer @see 'frame'
      */
     private onAshFrame(): void {
         const buffer = this.ash.rxQueue.getPrecedingEntry();
@@ -534,7 +534,7 @@ export class Ezsp extends EventEmitter<EmberEzspEventMap> {
             return EzspStatus.ERROR_COMMAND_TOO_LONG;
         }
 
-        return await this.queue.execute<EzspStatus>(async () => {
+        return await this.queue.run<EzspStatus>(async () => {
             let status: EzspStatus = EzspStatus.ASH_ERROR_TIMEOUTS; // will be overwritten below as necessary
             const frameId = sendBuffalo.getFrameId();
             const frameString = `[FRAME: ID=${frameId}:"${EzspFrameID[frameId]}" Seq=${sequence} Len=${length}]`;
@@ -1873,6 +1873,28 @@ export class Ezsp extends EventEmitter<EmberEzspEventMap> {
     }
 
     /**
+     * Set the channel number the device will accept in ZDO Mgmt Network Update command to change channel.
+     * If a ZDO Mgmt Network Update command is received by the device specifying a channel that does not match with the given
+     * channel, the ZDO Mgmt Network Update command will be ignored by the device.
+     * A value of 0xFF indicates that any channel received in a ZDO Mgmt Network Update command
+     * will be accepted which is also the default value set by the stack.
+     * @param channel uint8_t
+     */
+    async ezspSetPendingNetworkUpdateChannel(channel: number): Promise<void> {
+        if (this.version < 0x12) {
+            throw new EzspError(EzspStatus.ERROR_INVALID_FRAME_ID);
+        }
+
+        const sendBuffalo = this.startCommand(EzspFrameID.SET_PENDING_NETWORK_UPDATE_CHANNEL);
+        sendBuffalo.writeUInt8(channel);
+        const sendStatus = await this.sendCommand(sendBuffalo);
+
+        if (sendStatus !== EzspStatus.SUCCESS) {
+            throw new EzspError(sendStatus);
+        }
+    }
+
+    /**
      * Retrieve the endpoint number located at the specified index.
      * @param index uint8_t Index to retrieve the endpoint number for.
      * @returns uint8_t Endpoint number at the index.
@@ -2096,33 +2118,29 @@ export class Ezsp extends EventEmitter<EmberEzspEventMap> {
 
         // the size of corresponding the EZSP Mfg token, please refer to app/util/ezsp/ezsp-enum.h
         switch (tokenId) {
-            // 2 bytes
+            case EzspMfgTokenId.BOOTLOAD_AES_KEY:
+            case EzspMfgTokenId.SL_ZIGBEE_EZSP_STORAGE:
+            case EzspMfgTokenId.STRING:
+                expectedTokenDataLength = 255; // removed legacy
+                break;
             case EzspMfgTokenId.CUSTOM_VERSION:
             case EzspMfgTokenId.MANUF_ID:
             case EzspMfgTokenId.PHY_CONFIG:
             case EzspMfgTokenId.CTUNE:
                 expectedTokenDataLength = 2;
                 break;
-            // 8 bytes
-            case EzspMfgTokenId.EZSP_STORAGE:
             case EzspMfgTokenId.CUSTOM_EUI_64:
                 expectedTokenDataLength = 8;
                 break;
-            // 16 bytes
-            case EzspMfgTokenId.STRING:
             case EzspMfgTokenId.BOARD_NAME:
-            case EzspMfgTokenId.BOOTLOAD_AES_KEY:
                 expectedTokenDataLength = 16;
                 break;
-            // 20 bytes
             case EzspMfgTokenId.INSTALLATION_CODE:
                 expectedTokenDataLength = 20;
                 break;
-            // 40 bytes
             case EzspMfgTokenId.ASH_CONFIG:
                 expectedTokenDataLength = 40;
                 break;
-            // 92 bytes
             case EzspMfgTokenId.CBKE_DATA:
                 expectedTokenDataLength = 92;
                 break;
@@ -2130,7 +2148,7 @@ export class Ezsp extends EventEmitter<EmberEzspEventMap> {
                 break;
         }
 
-        if (tokenDataLength !== expectedTokenDataLength) {
+        if (expectedTokenDataLength === 255 || tokenDataLength !== expectedTokenDataLength) {
             throw new EzspError(EzspStatus.ERROR_INVALID_VALUE);
         }
 
@@ -4765,6 +4783,23 @@ export class Ezsp extends EventEmitter<EmberEzspEventMap> {
     }
 
     /**
+     * When enabled, the stack clears the binding table on definitive leave (not
+     * leave-with-rejoin), as required for Zigbee 4.0 security profile (e.g.
+     * CN-Reset-TC-01).
+     * @param clear True to clear bindings on leave; false to disable.
+     */
+    async ezspClearBindingTableOnLeave(clear: boolean): Promise<void> {
+        const sendBuffalo = this.startCommand(EzspFrameID.CLEAR_BINDING_TABLE_ON_LEAVE);
+        sendBuffalo.writeUInt8(clear ? 1 : 0);
+
+        const sendStatus = await this.sendCommand(sendBuffalo);
+
+        if (sendStatus !== EzspStatus.SUCCESS) {
+            throw new EzspError(sendStatus);
+        }
+    }
+
+    /**
      * Callback
      * The NCP used the external binding modification policy to decide how to handle
      * a remote set binding request. The Host cannot change the current decision,
@@ -5354,7 +5389,9 @@ export class Ezsp extends EventEmitter<EmberEzspEventMap> {
             (apsFrame.profileId === ZSpec.GP_PROFILE_ID && type !== EmberIncomingMessageType.BROADCAST_LOOPBACK) ||
             // TODO: Better (dynamic) way to handle this?
             // Shelly custom Clusters require a special profile ID
-            apsFrame.profileId === ZSpec.CUSTOM_SHELLY_PROFILE_ID
+            apsFrame.profileId === ZSpec.CUSTOM_SHELLY_PROFILE_ID ||
+            // Control4 custom Clusters require a special profile ID
+            apsFrame.profileId === ZSpec.CUSTOM_CONTROL4_PROFILE_ID
         ) {
             this.emit("incomingMessage", type, apsFrame, packetInfo.lastHopLqi, packetInfo.senderShortId, messageContents);
         }

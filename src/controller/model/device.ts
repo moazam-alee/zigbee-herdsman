@@ -1,6 +1,5 @@
 import assert from "node:assert";
 import type {Events as AdapterEvents} from "../../adapter";
-import type {LQINeighbor, RoutingTableEntry} from "../../adapter/tstype";
 import {wait} from "../../utils";
 import {logger} from "../../utils/logger";
 import * as timeService from "../../utils/timeService";
@@ -8,13 +7,26 @@ import * as ZSpec from "../../zspec";
 import {BroadcastAddress} from "../../zspec/enums";
 import type {Eui64} from "../../zspec/tstypes";
 import * as Zcl from "../../zspec/zcl";
-import type {TPartialClusterAttributes} from "../../zspec/zcl/definition/clusters-types";
-import type {ClusterDefinition, CustomClusters} from "../../zspec/zcl/definition/tstype";
+import type {TClusterCommandPayload, TPartialClusterAttributes} from "../../zspec/zcl/definition/clusters-types";
+import type {Cluster, CustomClusters} from "../../zspec/zcl/definition/tstype";
+import type {TFoundationZclFrame, TZclFrame} from "../../zspec/zcl/zclFrame";
 import * as Zdo from "../../zspec/zdo";
+import type {BindingTableEntry, LQITableEntry, RoutingTableEntry} from "../../zspec/zdo/definition/tstypes";
 import type {ControllerEventMap} from "../controller";
+import {getOtaFirmware, getOtaIndex, OtaSession, parseOtaImage} from "../helpers/ota";
 import zclTransactionSequenceNumber from "../helpers/zclTransactionSequenceNumber";
-import type {DatabaseEntry, DeviceType, KeyValue} from "../tstype";
-import Endpoint from "./endpoint";
+import type {
+    DatabaseEntry,
+    DeviceType,
+    KeyValue,
+    OtaDataSettings,
+    OtaExtraMetas,
+    OtaImage,
+    OtaSource,
+    OtaUpdateAvailableResult,
+    ZigbeeOtaImageMeta,
+} from "../tstype";
+import Endpoint, {type BindInternal} from "./endpoint";
 import Entity from "./entity";
 
 const NS = "zh:controller:device";
@@ -31,19 +43,10 @@ const INTERVIEW_GENBASIC_ATTRIBUTES = [
     "swBuildId",
 ] as const;
 
-interface Lqi {
-    neighbors: {
-        ieeeAddr: string;
-        networkAddress: number;
-        linkquality: number;
-        relationship: number;
-        depth: number;
-    }[];
-}
-
-interface RoutingTable {
-    table: {destinationAddress: number; status: string; nextHop: number}[];
-}
+const GEN_BASIC_CLUSTER_ID = Zcl.Clusters.genBasic.ID;
+const GEN_TIME_CLUSTER_ID = Zcl.Clusters.genTime.ID;
+const GEN_POLL_CTRL_CLUSTER_ID = Zcl.Clusters.genPollCtrl.ID;
+const GEN_OTA_CLUSTER_ID = Zcl.Clusters.genOta.ID;
 
 type CustomReadResponse = (frame: Zcl.Frame, endpoint: Endpoint) => boolean;
 
@@ -73,6 +76,9 @@ export class Device extends Entity<ControllerEventMap> {
     private _pendingRequestTimeout: number;
     private _customClusters: CustomClusters = {};
     private _gpSecurityKey?: number[];
+    #scheduledOta: OtaSource | undefined;
+    #otaInProgress = false;
+    #otaAbortController: AbortController | undefined;
 
     // Getters/setters
     get ieeeAddr(): string {
@@ -196,6 +202,7 @@ export class Device extends Entity<ControllerEventMap> {
     get customReadResponse(): CustomReadResponse | undefined {
         return this._customReadResponse;
     }
+    /** If the set function returns true, the default read response behavior is skipped */
     set customReadResponse(customReadResponse: CustomReadResponse | undefined) {
         this._customReadResponse = customReadResponse;
     }
@@ -221,6 +228,12 @@ export class Device extends Entity<ControllerEventMap> {
     }
     get genBasic(): TPartialClusterAttributes<"genBasic"> {
         return this.#genBasic;
+    }
+    get scheduledOta(): OtaSource | undefined {
+        return this.#scheduledOta;
+    }
+    get otaInProgress(): boolean {
+        return this.#otaInProgress;
     }
 
     public meta: KeyValue;
@@ -254,6 +267,7 @@ export class Device extends Entity<ControllerEventMap> {
         checkinInterval: number | undefined,
         pendingRequestTimeout: number,
         gpSecurityKey: number[] | undefined,
+        scheduledOta: OtaSource | undefined,
     ) {
         super();
         this.ID = id;
@@ -278,6 +292,22 @@ export class Device extends Entity<ControllerEventMap> {
         this._checkinInterval = checkinInterval;
         this._pendingRequestTimeout = pendingRequestTimeout;
         this._gpSecurityKey = gpSecurityKey;
+        this.#scheduledOta = scheduledOta;
+    }
+
+    /**
+     * Reset transient data about the device.
+     * @param cache If true, reset some previously cached data.
+     *   Should be set to true when device potentially changed its internal data to prevent mismatching state/config.
+     */
+    resetTransient(cache: boolean): void {
+        this._lastDefaultResponseSequenceNumber = undefined;
+
+        if (cache) {
+            // force retrieving this data again
+            this._checkinInterval = undefined;
+            this._pendingRequestTimeout = 0;
+        }
     }
 
     public createEndpoint(id: number): Endpoint {
@@ -336,126 +366,238 @@ export class Device extends Entity<ControllerEventMap> {
         return this.endpoints.find((e) => e.hasPendingRequests()) !== undefined;
     }
 
-    public async onZclData(dataPayload: AdapterEvents.ZclPayload, frame: Zcl.Frame, endpoint: Endpoint): Promise<void> {
-        // Respond to enroll requests
-        if (frame.header.isSpecific && frame.isCluster("ssIasZone") && frame.isCommand("enrollReq")) {
-            logger.debug(`IAS - '${this.ieeeAddr}' responding to enroll response`, NS);
-            const payload = {enrollrspcode: 0, zoneid: 23};
-            await endpoint.command("ssIasZone", "enrollRsp", payload, {disableDefaultResponse: true});
+    public async onZclData(
+        dataPayload: AdapterEvents.ZclPayload,
+        frame: Zcl.Frame | undefined,
+        endpoint: Endpoint,
+        defaultResponse: Zcl.Status | undefined,
+    ): Promise<void> {
+        if (!Device.devices.has(this.ieeeAddr)) {
+            // prevent race conditions where device gets deleted during processing
+            return;
         }
 
-        // Response to read requests
-        if (frame.header.isGlobal && frame.isCommand("read") && !this._customReadResponse?.(frame, endpoint)) {
-            const attributes: {[s: string]: KeyValue} = {
-                ...endpoint.clusters,
-            };
-
-            const isTimeReadRequest = dataPayload.clusterID === Zcl.Clusters.genTime.ID;
-            if (isTimeReadRequest) {
-                attributes.genTime = {
-                    attributes: timeService.getTimeClusterAttributes(),
-                };
-            }
-
-            if (frame.cluster.name in attributes) {
-                const response: KeyValue = {};
-
-                for (const entry of frame.payload) {
-                    const name = frame.cluster.getAttribute(entry.attrId)?.name;
-
-                    if (name && name in attributes[frame.cluster.name].attributes) {
-                        response[name] = attributes[frame.cluster.name].attributes[name];
-                    }
-                }
-
-                try {
-                    await endpoint.readResponse(frame.cluster.ID, frame.header.transactionSequenceNumber, response, {
-                        srcEndpoint: dataPayload.destinationEndpoint,
-                    });
-                } catch (error) {
-                    logger.error(`Read response to ${this.ieeeAddr} failed (${(error as Error).message})`, NS);
-                }
-            }
+        if (this.type === "GreenPower") {
+            // nothing below applies
+            return;
         }
 
-        // Handle check-in from sleeping end devices
-        if (frame.header.isSpecific && frame.isCluster("genPollCtrl") && frame.isCommand("checkin")) {
-            try {
-                if (this.hasPendingRequests() || this._checkinInterval === undefined) {
-                    logger.debug(`check-in from ${this.ieeeAddr}: accepting fast-poll`, NS);
-                    await endpoint.command(
-                        frame.cluster.name as "genPollCtrl",
-                        "checkinRsp",
-                        {
-                            startFastPolling: 1,
-                            fastPollTimeout: 0,
-                        },
-                        {sendPolicy: "immediate"},
-                    );
+        if (!frame) {
+            // The payload could not be parsed, but the sender may still expect a default response. Some devices retransmit the
+            // same frame indefinitely until they get one, e.g. BSEED TS011F `_TZ3210_5ct6e7ye` reporting a malformed array on
+            // cluster 0xE000: https://github.com/Koenkk/zigbee2mqtt/issues/33174
+            const header = dataPayload.header;
 
-                    // This is a good time to read the checkin interval if we haven't stored it previously
-                    if (this._checkinInterval === undefined) {
-                        const pollPeriod = await endpoint.read("genPollCtrl", ["checkinInterval"], {sendPolicy: "immediate"});
-                        this._checkinInterval = pollPeriod.checkinInterval / 4; // convert to seconds
-                        this.resetPendingRequestTimeout();
-                        logger.debug(`Request Queue (${this.ieeeAddr}): default expiration timeout set to ${this.pendingRequestTimeout}`, NS);
+            if (
+                header &&
+                !dataPayload.wasBroadcast &&
+                !(header.isGlobal && header.commandIdentifier === Zcl.Foundation.defaultRsp.ID) // per spec
+            ) {
+                await this.sendDefaultResponse(endpoint, dataPayload.clusterID, header, defaultResponse ?? Zcl.Status.SUCCESS);
+            }
+
+            return;
+        }
+
+        const {header, command, cluster} = frame;
+        let sendDefaultResponse = !dataPayload.wasBroadcast && command.response === undefined;
+        let defaultResponseStatus = defaultResponse ?? Zcl.Status.SUCCESS;
+
+        if (header.isGlobal) {
+            // Response to read requests from device to coordinator
+            switch (command.name) {
+                case "read": {
+                    // NOTE: `sendDefaultResponse` always false from `command.response === 0x01`
+
+                    if (this._customReadResponse?.(frame, endpoint)) {
+                        break;
                     }
 
-                    await Promise.all(this.endpoints.map(async (e) => await e.sendPendingRequests(true)));
-                    // We *must* end fast-poll when we're done sending things. Otherwise
-                    // we cause undue power-drain.
-                    logger.debug(`check-in from ${this.ieeeAddr}: stopping fast-poll`, NS);
-                    await endpoint.command(frame.cluster.name as "genPollCtrl", "fastPollStop", {}, {sendPolicy: "immediate"});
-                } else {
-                    logger.debug(`check-in from ${this.ieeeAddr}: declining fast-poll`, NS);
-                    await endpoint.command(
-                        frame.cluster.name as "genPollCtrl",
-                        "checkinRsp",
-                        {
-                            startFastPolling: 0,
-                            fastPollTimeout: 0,
-                        },
-                        {sendPolicy: "immediate"},
-                    );
+                    const response: KeyValue = {};
+
+                    switch (dataPayload.clusterID) {
+                        case GEN_TIME_CLUSTER_ID: {
+                            // relax type to index by attr name, undefined results in non-success attr record
+                            const timeAttrs = timeService.getTimeClusterAttributes() as Record<string, unknown>;
+
+                            for (const entry of frame.payload) {
+                                // TODO: this.manufacturerID or frame.header.manufacturerCode
+                                const name = Zcl.Utils.getClusterAttribute(cluster, entry.attrId, this.manufacturerID)?.name;
+
+                                if (name === undefined) {
+                                    // UNSUPPORTED_ATTRIBUTE
+                                    response[entry.attrId] = {value: undefined, type: Zcl.DataType.NO_DATA};
+                                } else {
+                                    response[name] = timeAttrs[name];
+                                }
+                            }
+                            break;
+                        }
+                        // NOTE: can add more clusters here to use defaults from spec as needed
+                        case GEN_BASIC_CLUSTER_ID: {
+                            for (const entry of frame.payload) {
+                                // TODO: this.manufacturerID or frame.header.manufacturerCode
+                                const attr = Zcl.Utils.getClusterAttribute(cluster, entry.attrId, this.manufacturerID);
+
+                                if (attr?.default === undefined) {
+                                    // UNSUPPORTED_ATTRIBUTE
+                                    response[entry.attrId] = {value: undefined, type: Zcl.DataType.NO_DATA};
+                                } else {
+                                    response[attr.name] = attr.default;
+                                }
+                            }
+
+                            break;
+                        }
+                        default: {
+                            for (const entry of frame.payload) {
+                                // UNSUPPORTED_ATTRIBUTE
+                                response[entry.attrId] = {value: undefined, type: Zcl.DataType.NO_DATA};
+                            }
+
+                            break;
+                        }
+                    }
+
+                    try {
+                        await endpoint.readResponse(cluster.ID, header.transactionSequenceNumber, response, {
+                            srcEndpoint: dataPayload.destinationEndpoint,
+                        });
+                    } catch (error) {
+                        logger.error(`Read response to ${this.ieeeAddr} failed (${(error as Error).message})`, NS);
+                        // XXX: technically, if `readResponse` fails before reaching the network (internal to ZH), we should send a default response
+                        //      currently not possible due to implementation (no distinction as to "where" it failed)
+                    }
+
+                    break;
                 }
-            } catch (error) {
-                logger.error(`Handling of poll check-in from ${this.ieeeAddr} failed (${(error as Error).message})`, NS);
+                case "defaultRsp": {
+                    sendDefaultResponse = false; // per spec
+                    break;
+                }
+            }
+        } else if (header.isSpecific) {
+            switch (cluster.name) {
+                case "ssIasZone": {
+                    if (command.name === "enrollReq") {
+                        // Respond to enroll requests
+                        logger.debug(`IAS - '${this.ieeeAddr}' responding to enroll response`, NS);
+
+                        try {
+                            await endpoint.command(
+                                "ssIasZone",
+                                "enrollRsp",
+                                {enrollrspcode: 0, zoneid: 23},
+                                {transactionSequenceNumber: header.transactionSequenceNumber, disableDefaultResponse: true},
+                            );
+
+                            sendDefaultResponse = false; // per spec, sending a specific response TODO: no "Effect on receipt" in spec, is this correct?
+                        } catch (error) {
+                            logger.error(`Handling of IAS zone enroll for ${this.ieeeAddr} failed (${(error as Error).message})`, NS);
+                            defaultResponseStatus = Zcl.Status.FAILURE;
+                        }
+                    }
+                    break;
+                }
+                case "genPollCtrl": {
+                    if (command.name === "checkin") {
+                        let startedFastPolling = false;
+
+                        // Handle check-in from sleeping end devices
+                        try {
+                            if (this.hasPendingRequests() || this._checkinInterval === undefined) {
+                                logger.debug(`check-in from ${this.ieeeAddr}: accepting fast-poll`, NS);
+                                await endpoint.command(
+                                    cluster.name as "genPollCtrl",
+                                    "checkinRsp",
+                                    {startFastPolling: 1, fastPollTimeout: 0},
+                                    {
+                                        transactionSequenceNumber: header.transactionSequenceNumber,
+                                        disableDefaultResponse: true,
+                                        sendPolicy: "immediate",
+                                    },
+                                );
+                                startedFastPolling = true;
+
+                                // This is a good time to read the checkin interval if we haven't stored it previously
+                                if (this._checkinInterval === undefined) {
+                                    const pollPeriod = await endpoint.read("genPollCtrl", ["checkinInterval"], {sendPolicy: "immediate"});
+                                    this._checkinInterval = pollPeriod.checkinInterval / 4; // convert to seconds
+                                    this.resetPendingRequestTimeout();
+                                    logger.debug(
+                                        `Request Queue (${this.ieeeAddr}): default expiration timeout set to ${this.pendingRequestTimeout}`,
+                                        NS,
+                                    );
+                                }
+
+                                await Promise.all(this.endpoints.map(async (e) => await e.sendPendingRequests(true)));
+                            } else {
+                                logger.debug(`check-in from ${this.ieeeAddr}: declining fast-poll`, NS);
+                                await endpoint.command(
+                                    cluster.name as "genPollCtrl",
+                                    "checkinRsp",
+                                    {startFastPolling: 0, fastPollTimeout: 0},
+                                    {
+                                        transactionSequenceNumber: header.transactionSequenceNumber,
+                                        disableDefaultResponse: true,
+                                        sendPolicy: "immediate",
+                                    },
+                                );
+                            }
+
+                            sendDefaultResponse = false; // per spec, sending a specific response
+                        } catch (error) {
+                            logger.error(`Handling of poll check-in from ${this.ieeeAddr} failed (${(error as Error).message})`, NS);
+                            defaultResponseStatus = Zcl.Status.FAILURE;
+                        } finally {
+                            if (startedFastPolling) {
+                                // We *must* end fast-poll when we're done sending things. Otherwise we cause undue power-drain.
+                                logger.debug(`check-in from ${this.ieeeAddr}: stopping fast-poll`, NS);
+
+                                try {
+                                    await endpoint.command(cluster.name as "genPollCtrl", "fastPollStop", {}, {sendPolicy: "immediate"});
+                                } catch (error) {
+                                    logger.error(`Failed to stop fast poll for ${this.ieeeAddr} (${(error as Error).message})`, NS);
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
             }
         }
 
-        // Send a default response if necessary.
-        const isDefaultResponse = frame.header.isGlobal && frame.command.name === "defaultRsp";
-        const commandHasResponse = frame.command.response !== undefined;
-        const disableDefaultResponse = frame.header.frameControl.disableDefaultResponse;
+        if (sendDefaultResponse) {
+            await this.sendDefaultResponse(endpoint, cluster.ID, header, defaultResponseStatus);
+        }
+    }
+
+    /**
+     * Send a default response to a received frame, unless the sender disabled it (and status is SUCCESS),
+     * default responses are skipped for this device, or the frame was already answered.
+     */
+    private async sendDefaultResponse(endpoint: Endpoint, clusterID: number, header: Zcl.Header, status: Zcl.Status): Promise<void> {
         /* v8 ignore next */
-        const disableTuyaDefaultResponse = endpoint.getDevice().manufacturerName?.startsWith("_TZ") && process.env.DISABLE_TUYA_DEFAULT_RESPONSE;
+        const disableTuyaDefaultResponse = this.manufacturerName?.startsWith("_TZ") && process.env.DISABLE_TUYA_DEFAULT_RESPONSE;
         // Sometimes messages are received twice, prevent responding twice
-        const alreadyResponded = this._lastDefaultResponseSequenceNumber === frame.header.transactionSequenceNumber;
+        const alreadyResponded = this._lastDefaultResponseSequenceNumber === header.transactionSequenceNumber;
 
         if (
-            this.type !== "GreenPower" &&
-            !dataPayload.wasBroadcast &&
-            !disableDefaultResponse &&
-            !isDefaultResponse &&
-            !commandHasResponse &&
             !this._skipDefaultResponse &&
+            (!header.frameControl.disableDefaultResponse || status !== Zcl.Status.SUCCESS) &&
             !alreadyResponded &&
             !disableTuyaDefaultResponse
         ) {
             try {
-                this._lastDefaultResponseSequenceNumber = frame.header.transactionSequenceNumber;
-                // In the ZCL it is not documented what the direction of the default response should be
-                // In https://github.com/Koenkk/zigbee2mqtt/issues/18096 a commandResponse (SERVER_TO_CLIENT)
-                // is send and the device expects a CLIENT_TO_SERVER back.
-                // Previously SERVER_TO_CLIENT was always used.
-                // Therefore for non-global commands we inverse the direction.
-                const direction = frame.header.isGlobal
-                    ? Zcl.Direction.SERVER_TO_CLIENT
-                    : frame.header.frameControl.direction === Zcl.Direction.CLIENT_TO_SERVER
-                      ? Zcl.Direction.SERVER_TO_CLIENT
-                      : Zcl.Direction.CLIENT_TO_SERVER;
+                this._lastDefaultResponseSequenceNumber = header.transactionSequenceNumber;
+                const direction =
+                    header.frameControl.direction === Zcl.Direction.CLIENT_TO_SERVER
+                        ? Zcl.Direction.SERVER_TO_CLIENT
+                        : Zcl.Direction.CLIENT_TO_SERVER;
 
-                await endpoint.defaultResponse(frame.command.ID, 0, frame.cluster.ID, frame.header.transactionSequenceNumber, {direction});
+                await endpoint.defaultResponse(header.commandIdentifier, status, clusterID, header.transactionSequenceNumber, {
+                    direction,
+                });
             } catch (error) {
                 logger.debug(`Default response to ${this.ieeeAddr} failed (${error})`, NS);
             }
@@ -493,7 +635,7 @@ export class Device extends Entity<ControllerEventMap> {
 
         // default: no timeout (messages expire immediately after first send attempt)
         let pendingRequestTimeout = 0;
-        if (endpoints.filter((e): boolean => e.inputClusters.includes(Zcl.Clusters.genPollCtrl.ID)).length > 0) {
+        if (endpoints.filter((e): boolean => e.inputClusters.includes(GEN_POLL_CTRL_CLUSTER_ID)).length > 0) {
             // default for devices that support genPollCtrl cluster (RX off when idle): 1 day
             pendingRequestTimeout = 86400000;
         }
@@ -532,6 +674,7 @@ export class Device extends Entity<ControllerEventMap> {
             entry.checkinInterval,
             pendingRequestTimeout,
             entry.gpSecurityKey,
+            entry.scheduledOta,
         );
     }
 
@@ -567,6 +710,7 @@ export class Device extends Entity<ControllerEventMap> {
             lastSeen: this.lastSeen,
             checkinInterval: this.checkinInterval,
             gpSecurityKey: this.gpSecurityKey,
+            scheduledOta: this.scheduledOta,
         };
     }
 
@@ -615,6 +759,22 @@ export class Device extends Entity<ControllerEventMap> {
         }
 
         return devices;
+    }
+
+    /** Check if a device is explicitly deleted */
+    public static isDeletedByIeeeAddr(ieeeAddr: string): boolean {
+        Device.loadFromDatabaseIfNecessary();
+
+        return Device.deletedDevices.has(ieeeAddr);
+    }
+
+    /** Check if a device is explicitly deleted */
+    public static isDeletedByNetworkAddress(networkAddress: number): boolean {
+        Device.loadFromDatabaseIfNecessary();
+
+        const ieeeAddr = Device.nwkToIeeeCache.get(networkAddress);
+
+        return ieeeAddr ? Device.deletedDevices.has(ieeeAddr) : false;
     }
 
     /**
@@ -685,6 +845,7 @@ export class Device extends Entity<ControllerEventMap> {
             undefined,
             0,
             gpSecurityKey,
+            undefined,
         );
 
         Entity.database.insert(device.toDatabaseEntry());
@@ -750,6 +911,19 @@ export class Device extends Entity<ControllerEventMap> {
             return true;
         }
 
+        // Control4 in-wall dimmers/keypads do not answer genBasic reads at all, so the interview always
+        // fails before a modelID is known and the modelID-keyed quirks below can never match them. The
+        // node descriptor already identifies them unambiguously (manufacturerCode 0xabcd), and their
+        // proprietary text protocol handles identification beyond this.
+        // https://github.com/Koenkk/zigbee-herdsman/pull/1792
+        if (this._manufacturerID === 0xabcd) {
+            this.#genBasic.manufacturerName = "Control4";
+            this.#genBasic.modelId = "C4-Zigbee";
+            this.#genBasic.powerSource = Zcl.PowerSource["Mains (single phase)"];
+            logger.debug("Interview - quirks matched for Control4 device", NS);
+            return true;
+        }
+
         // Some devices, e.g. Xiaomi end devices have a different interview procedure, after pairing they
         // report it's modelID trough a readResponse. The readResponse is received by the controller and set
         // on the device.
@@ -784,6 +958,8 @@ export class Device extends Entity<ControllerEventMap> {
             "C-ZB-SEMO": {}, //candeo device that doesn't follow IAS enrollment process correctly and therefore fails to complete interview
             "CS-T9C-A0-BG": {}, // iAS enroll fails: https://github.com/Koenkk/zigbee2mqtt/issues/27822
             "SNZB-01": {}, // iAS enroll fails: https://github.com/Koenkk/zigbee2mqtt/issues/29474
+            "3011": {type: "EndDevice", powerSource: Zcl.PowerSource.Battery}, // NYCE NCZ-3011-HA fails IAS CIE address write during interview: https://github.com/Koenkk/zigbee2mqtt/issues/32480
+            "Smart Siren": {manufacturerName: "AduroSmart Eria"}, // iAS enroll fails: https://github.com/Koenkk/zigbee2mqtt/issues/32839
         };
 
         let match: string | undefined;
@@ -878,6 +1054,7 @@ export class Device extends Entity<ControllerEventMap> {
         logger.debug(`Interview - got active endpoints for device '${this.ieeeAddr}'`, NS);
 
         const coordinator = Device.byType("Coordinator")[0];
+        const genBasicAttrs = new Set(INTERVIEW_GENBASIC_ATTRIBUTES);
 
         for (const endpoint of this._endpoints) {
             await endpoint.updateSimpleDescriptor();
@@ -886,8 +1063,13 @@ export class Device extends Entity<ControllerEventMap> {
             // Read attributes
             // nice to have but not required for successful pairing as most of the attributes are not mandatory in ZCL specification
             if (endpoint.supportsInputCluster("genBasic")) {
-                for (const key of INTERVIEW_GENBASIC_ATTRIBUTES) {
-                    if (ignoreCache || !this.#genBasic[key]) {
+                for (const key of genBasicAttrs) {
+                    if (
+                        ignoreCache ||
+                        this.#genBasic[key] === undefined ||
+                        this.#genBasic[key] === "" ||
+                        (key === "powerSource" && this.#genBasic.powerSource === Zcl.PowerSource.Unknown)
+                    ) {
                         try {
                             let result: TPartialClusterAttributes<"genBasic">;
 
@@ -908,6 +1090,7 @@ export class Device extends Entity<ControllerEventMap> {
                             }
 
                             this.updateGenBasic(result);
+                            genBasicAttrs.delete(key);
                             logger.debug(`Interview - got '${key}' for device '${this.ieeeAddr}'`, NS);
                         } catch (error) {
                             logger.debug(`Interview - failed to read attribute '${key}' from endpoint '${endpoint.ID}' (${error})`, NS);
@@ -921,7 +1104,7 @@ export class Device extends Entity<ControllerEventMap> {
                 logger.debug(`Interview - IAS - enrolling '${this.ieeeAddr}' endpoint '${endpoint.ID}'`, NS);
 
                 const stateBefore = await endpoint.read("ssIasZone", ["iasCieAddr", "zoneState"], {sendPolicy: "immediate"});
-                logger.debug(`Interview - IAS - before enrolling state: '${JSON.stringify(stateBefore)}'`, NS);
+                logger.debug(() => `Interview - IAS - before enrolling state: '${JSON.stringify(stateBefore)}'`, NS);
 
                 // Do not enroll when device has already been enrolled
                 if (stateBefore.zoneState !== 1 || stateBefore.iasCieAddr !== coordinator.ieeeAddr) {
@@ -945,7 +1128,7 @@ export class Device extends Entity<ControllerEventMap> {
                     for (let attempt = 0; attempt < 20; attempt++) {
                         await wait(500);
                         const stateAfter = await endpoint.read("ssIasZone", ["iasCieAddr", "zoneState"], {sendPolicy: "immediate"});
-                        logger.debug(`Interview - IAS - after enrolling state (${attempt}): '${JSON.stringify(stateAfter)}'`, NS);
+                        logger.debug(() => `Interview - IAS - after enrolling state (${attempt}): '${JSON.stringify(stateAfter)}'`, NS);
                         if (stateAfter.zoneState === 1) {
                             enrolled = true;
                             break;
@@ -1057,7 +1240,7 @@ export class Device extends Entity<ControllerEventMap> {
         await Entity.adapter.sendZdo(this.ieeeAddr, ZSpec.BroadcastAddress.RX_ON_WHEN_IDLE, clusterId, zdoPayload, true);
     }
 
-    public async removeFromNetwork(): Promise<void> {
+    public async removeFromNetwork(clearCache = false): Promise<void> {
         if (this._type === "GreenPower") {
             const payload = {
                 options: 0x002550,
@@ -1091,10 +1274,10 @@ export class Device extends Entity<ControllerEventMap> {
             }
         }
 
-        this.removeFromDatabase();
+        this.removeFromDatabase(clearCache);
     }
 
-    public removeFromDatabase(): void {
+    public removeFromDatabase(clearCache = false): void {
         Device.loadFromDatabaseIfNecessary();
 
         for (const endpoint of this.endpoints) {
@@ -1105,34 +1288,37 @@ export class Device extends Entity<ControllerEventMap> {
             Entity.database.remove(this.ID);
         }
 
-        Device.deletedDevices.set(this.ieeeAddr, this);
-        Device.devices.delete(this.ieeeAddr);
+        if (clearCache) {
+            Device.devices.delete(this.ieeeAddr);
+        } else {
+            Device.deletedDevices.set(this.ieeeAddr, this);
+            Device.devices.delete(this.ieeeAddr);
 
-        // Clear all data in case device joins again
-        // Green power devices are never interviewed, keep existing interview state.
-        this._interviewState = this.type === "GreenPower" ? this._interviewState : InterviewState.Pending;
-        this.meta = {};
-        const newEndpoints: Endpoint[] = [];
-        for (const endpoint of this.endpoints) {
-            newEndpoints.push(
-                Endpoint.create(
-                    endpoint.ID,
-                    endpoint.profileID,
-                    endpoint.deviceID,
-                    endpoint.inputClusters,
-                    endpoint.outputClusters,
-                    this.networkAddress,
-                    this.ieeeAddr,
-                ),
-            );
+            // Clear all data in case device joins again
+            // Green power devices are never interviewed, keep existing interview state.
+            this._interviewState = this.type === "GreenPower" ? this._interviewState : InterviewState.Pending;
+            this.meta = {};
+            const newEndpoints: Endpoint[] = [];
+            for (const endpoint of this.endpoints) {
+                newEndpoints.push(
+                    Endpoint.create(
+                        endpoint.ID,
+                        endpoint.profileID,
+                        endpoint.deviceID,
+                        endpoint.inputClusters,
+                        endpoint.outputClusters,
+                        this.networkAddress,
+                        this.ieeeAddr,
+                    ),
+                );
+            }
+            this._endpoints = newEndpoints;
         }
-        this._endpoints = newEndpoints;
     }
 
-    public async lqi(): Promise<Lqi> {
+    public async lqi(): Promise<LQITableEntry[]> {
         const clusterId = Zdo.ClusterId.LQI_TABLE_REQUEST;
-        // TODO return Zdo.LQITableEntry directly (requires updates in other repos)
-        const neighbors: LQINeighbor[] = [];
+        const table: LQITableEntry[] = [];
         const request = async (startIndex: number): Promise<[tableEntries: number, entryCount: number]> => {
             const zdoPayload = Zdo.Buffalo.buildRequest(Entity.adapter.hasZdoMessageOverhead, clusterId, startIndex);
             const response = await Entity.adapter.sendZdo(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
@@ -1143,15 +1329,7 @@ export class Device extends Entity<ControllerEventMap> {
 
             const result = response[1];
 
-            for (const entry of result.entryList) {
-                neighbors.push({
-                    ieeeAddr: entry.eui64,
-                    networkAddress: entry.nwkAddress,
-                    linkquality: entry.lqi,
-                    relationship: entry.relationship,
-                    depth: entry.depth,
-                });
-            }
+            table.push(...result.entryList);
 
             return [result.neighborTableEntries, result.entryList.length];
         };
@@ -1161,18 +1339,17 @@ export class Device extends Entity<ControllerEventMap> {
         const size = tableEntries;
         let nextStartIndex = entryCount;
 
-        while (neighbors.length < size) {
+        while (table.length < size) {
             [tableEntries, entryCount] = await request(nextStartIndex);
 
             nextStartIndex += entryCount;
         }
 
-        return {neighbors};
+        return table;
     }
 
-    public async routingTable(): Promise<RoutingTable> {
+    public async routingTable(): Promise<RoutingTableEntry[]> {
         const clusterId = Zdo.ClusterId.ROUTING_TABLE_REQUEST;
-        // TODO return Zdo.RoutingTableEntry directly (requires updates in other repos)
         const table: RoutingTableEntry[] = [];
         const request = async (startIndex: number): Promise<[tableEntries: number, entryCount: number]> => {
             const zdoPayload = Zdo.Buffalo.buildRequest(Entity.adapter.hasZdoMessageOverhead, clusterId, startIndex);
@@ -1184,13 +1361,7 @@ export class Device extends Entity<ControllerEventMap> {
 
             const result = response[1];
 
-            for (const entry of result.entryList) {
-                table.push({
-                    destinationAddress: entry.destinationAddress,
-                    status: entry.status,
-                    nextHop: entry.nextHopAddress,
-                });
-            }
+            table.push(...result.entryList);
 
             return [result.routingTableEntries, result.entryList.length];
         };
@@ -1206,36 +1377,525 @@ export class Device extends Entity<ControllerEventMap> {
             nextStartIndex += entryCount;
         }
 
-        return {table};
+        return table;
+    }
+
+    public async bindingTable(): Promise<BindingTableEntry[]> {
+        const clusterId = Zdo.ClusterId.BINDING_TABLE_REQUEST;
+        const table: BindingTableEntry[] = [];
+        const request = async (startIndex: number): Promise<[tableEntries: number, entryCount: number]> => {
+            const zdoPayload = Zdo.Buffalo.buildRequest(Entity.adapter.hasZdoMessageOverhead, clusterId, startIndex);
+            const response = await Entity.adapter.sendZdo(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
+
+            if (!Zdo.Buffalo.checkStatus<Zdo.ClusterId.BINDING_TABLE_RESPONSE>(response)) {
+                throw new Zdo.StatusError(response[0]);
+            }
+
+            const result = response[1];
+
+            table.push(...result.entryList);
+
+            return [result.bindingTableEntries, result.entryList.length];
+        };
+
+        let [tableEntries, entryCount] = await request(0);
+
+        const size = tableEntries;
+        let nextStartIndex = entryCount;
+
+        while (table.length < size) {
+            [tableEntries, entryCount] = await request(nextStartIndex);
+            nextStartIndex += entryCount;
+        }
+
+        for (const ep of this._endpoints) {
+            const newBinds: BindInternal[] = [];
+
+            for (const entry of table) {
+                if (entry.sourceEui64 !== this.ieeeAddr || entry.sourceEndpoint !== ep.ID) {
+                    continue;
+                }
+
+                if (entry.destAddrMode === 0x01) {
+                    newBinds.push({type: "group", cluster: entry.clusterId, groupID: entry.dest as number});
+                } else {
+                    newBinds.push({
+                        type: "endpoint",
+                        cluster: entry.clusterId,
+                        deviceIeeeAddress: entry.dest as Eui64,
+                        endpointID: entry.destEndpoint as number,
+                    });
+                }
+            }
+
+            ep.saveBindings(newBinds);
+        }
+
+        return table;
+    }
+
+    /**
+     * Clear all the bindings of a device.
+     * Support of this command is optional (only mandatory if device has a binding table).
+     * @param eui64List list of bind entries to match and clear. Send `["0xffffffffffffffff"]` to clear all.
+     */
+    public async clearAllBindings(eui64List: Eui64[]): Promise<void> {
+        const clusterId = Zdo.ClusterId.CLEAR_ALL_BINDINGS_REQUEST;
+        const zdoPayload = Zdo.Buffalo.buildRequest(Entity.adapter.hasZdoMessageOverhead, clusterId, {eui64List});
+        const response = await Entity.adapter.sendZdo(this.ieeeAddr, this.networkAddress, clusterId, zdoPayload, false);
+
+        if (!Zdo.Buffalo.checkStatus<Zdo.ClusterId.CLEAR_ALL_BINDINGS_RESPONSE>(response)) {
+            throw new Zdo.StatusError(response[0]);
+        }
+
+        if (
+            (eui64List.length === 1 && eui64List[0].toLowerCase() === ZSpec.BLANK_EUI64) ||
+            eui64List.some((eui64) => eui64.toLowerCase() === this.ieeeAddr)
+        ) {
+            for (const ep of this._endpoints) {
+                ep.clearBindings();
+            }
+        }
     }
 
     public async ping(disableRecovery = true): Promise<void> {
         // Zigbee does not have an official pinging mechanism. Use a read request
         // of a mandatory basic cluster attribute to keep it as lightweight as
         // possible.
-        const endpoint = this.endpoints.find((ep) => ep.inputClusters.includes(0)) ?? this.endpoints[0];
+        const endpoint = this.endpoints.find((ep) => ep.inputClusters.includes(GEN_BASIC_CLUSTER_ID)) ?? this.endpoints[0];
         await endpoint.read("genBasic", ["zclVersion"], {disableRecovery, sendPolicy: "immediate"});
     }
 
-    public addCustomCluster(name: string, cluster: ClusterDefinition): void {
+    public addCustomCluster(name: string, cluster: Cluster): void {
         assert(
-            ![Zcl.Clusters.touchlink.ID, Zcl.Clusters.greenPower.ID].includes(cluster.ID),
+            cluster.ID !== Zcl.Clusters.touchlink.ID && cluster.ID !== Zcl.Clusters.greenPower.ID,
             "Overriding of greenPower or touchlink cluster is not supported",
         );
-        if (Zcl.Utils.isClusterName(name)) {
-            const existingCluster = Zcl.Clusters[name];
 
+        if (Zcl.Utils.isClusterName(name)) {
             // Extend existing cluster
+            const existingCluster = this._customClusters[name] ?? Zcl.Clusters[name];
             assert(existingCluster.ID === cluster.ID, `Custom cluster ID (${cluster.ID}) should match existing cluster ID (${existingCluster.ID})`);
-            cluster = {
+
+            const extendedCluster: Cluster = {
+                name: cluster.name,
                 ID: cluster.ID,
                 manufacturerCode: cluster.manufacturerCode,
                 attributes: {...existingCluster.attributes, ...cluster.attributes},
                 commands: {...existingCluster.commands, ...cluster.commands},
                 commandsResponse: {...existingCluster.commandsResponse, ...cluster.commandsResponse},
             };
+
+            this._customClusters[name] = extendedCluster;
+        } else {
+            this._customClusters[name] = cluster;
         }
-        this._customClusters[name] = cluster;
+    }
+
+    #waitForOtaCommand<Co extends string>(
+        endpointId: number,
+        commandId: number,
+        defaultRspCommandId: number | undefined,
+        timeout: number,
+    ): {promise: Promise<TZclFrame<"genOta", Co> | TFoundationZclFrame<"defaultRsp">>; cancel: () => void} {
+        const waiter = Entity.adapter.waitFor(
+            this.networkAddress,
+            endpointId,
+            Zcl.FrameType.SPECIFIC,
+            Zcl.Direction.CLIENT_TO_SERVER,
+            undefined,
+            GEN_OTA_CLUSTER_ID,
+            commandId,
+            defaultRspCommandId,
+            timeout,
+        );
+        const promise = new Promise<TZclFrame<"genOta", Co> | TFoundationZclFrame<"defaultRsp">>((resolve, reject) => {
+            waiter.promise.then(
+                (payload) => {
+                    try {
+                        const frame = Zcl.Frame.fromBuffer(payload.clusterID, payload.header, payload.data, this.customClusters);
+
+                        resolve(frame as TZclFrame<"genOta", Co> | TFoundationZclFrame<"defaultRsp">);
+                    } catch (error) {
+                        reject(error);
+                    }
+                },
+                (error) => reject(error),
+            );
+        });
+
+        return {promise, cancel: waiter.cancel};
+    }
+
+    async findMatchingOtaImage(
+        source: OtaSource,
+        current: TClusterCommandPayload<"genOta", "queryNextImageRequest">,
+        extraMetas: OtaExtraMetas,
+    ): Promise<ZigbeeOtaImageMeta | undefined> {
+        logger.debug(() => `Getting image metadata for ${this.ieeeAddr}...`, NS);
+
+        const images = await getOtaIndex(source);
+        // NOTE: Officially an image can be determined with a combination of manufacturerCode and imageType.
+        // However several manufacturers do not follow the spec properly.
+        // The index provides the needed extra metadata to prevent mismatches.
+        // e.g. Tuya must match on manufacturerName, Gledopto on modelId...
+        return images.find(
+            (i) =>
+                i.imageType === current.imageType &&
+                i.manufacturerCode === current.manufacturerCode &&
+                (i.minFileVersion === undefined || current.fileVersion >= i.minFileVersion) &&
+                (i.maxFileVersion === undefined || current.fileVersion <= i.maxFileVersion) &&
+                // let extra metas override the match from this.modelID, same for manufacturerName
+                (!i.modelId || i.modelId === this.modelID || i.modelId === extraMetas.modelId) &&
+                (!i.manufacturerName ||
+                    // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
+                    i.manufacturerName.includes(this.manufacturerName!) ||
+                    // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
+                    i.manufacturerName.includes(extraMetas.manufacturerName!)) &&
+                (!extraMetas.otaHeaderString || i.otaHeaderString === extraMetas.otaHeaderString) &&
+                (i.hardwareVersionMin === undefined ||
+                    (current.hardwareVersion !== undefined && current.hardwareVersion >= i.hardwareVersionMin) ||
+                    (extraMetas.hardwareVersionMin !== undefined && extraMetas.hardwareVersionMin >= i.hardwareVersionMin)) &&
+                (i.hardwareVersionMax === undefined ||
+                    (current.hardwareVersion !== undefined && current.hardwareVersion <= i.hardwareVersionMax) ||
+                    (extraMetas.hardwareVersionMax !== undefined && extraMetas.hardwareVersionMax <= i.hardwareVersionMax)),
+        );
+    }
+
+    async #notifyOta(endpoint: Endpoint): Promise<[payload: TClusterCommandPayload<"genOta", "queryNextImageRequest">, tsn: number]> {
+        // Some devices (e.g. Insta) take a very long trying to discover the correct coordinator EP for OTA
+        const queryNextImageRequest = this.#waitForOtaCommand<"queryNextImageRequest">(
+            endpoint.ID,
+            Zcl.Clusters.genOta.commands.queryNextImageRequest.ID,
+            Zcl.Clusters.genOta.commandsResponse.imageNotify.ID,
+            60000,
+        );
+
+        try {
+            await endpoint.commandResponse("genOta", "imageNotify", {payloadType: 0, queryJitter: 100}, {sendPolicy: "immediate"});
+
+            const response = await queryNextImageRequest.promise;
+
+            assert(response.header.isSpecific);
+
+            return [(response as TZclFrame<"genOta", "queryNextImageRequest">).payload, response.header.transactionSequenceNumber];
+        } catch {
+            queryNextImageRequest.cancel();
+
+            throw new Error(`Device didn't respond to OTA request`);
+        }
+    }
+
+    /**
+     * If `current` is undefined, will automatically notify and reply to query with `NO_IMAGE_AVAILABLE` (stops device from doing further requests).
+     */
+    async checkOta(
+        source: OtaSource,
+        current: TClusterCommandPayload<"genOta", "queryNextImageRequest"> | undefined,
+        extraMetas: OtaExtraMetas,
+        endpoint = this.endpoints.find((e) => e.supportsOutputCluster("genOta")),
+    ): Promise<OtaUpdateAvailableResult> {
+        assert(endpoint !== undefined, `No endpoint found with OTA cluster support for ${this.ieeeAddr}`);
+
+        if (this.modelID === "PP-WHT-US") {
+            // see https://github.com/Koenkk/zigbee-OTA/pull/14
+            const scenesEndpoint = this.endpoints.find((e) => e.supportsOutputCluster("genScenes"));
+
+            if (scenesEndpoint !== undefined) {
+                await scenesEndpoint.write("genScenes", {currentGroup: 49502});
+            }
+        }
+
+        if (current === undefined) {
+            let queryTsn: number;
+            [current, queryTsn] = await this.#notifyOta(endpoint);
+
+            await endpoint.commandResponse("genOta", "queryNextImageResponse", {status: Zcl.Status.NO_IMAGE_AVAILABLE}, undefined, queryTsn);
+        }
+
+        logger.debug(
+            () =>
+                `Checking OTA ${this.ieeeAddr} ${source.downgrade ? "downgrade" : "upgrade"} image availability, current=${JSON.stringify(current)}`,
+            NS,
+        );
+
+        if (
+            this.meta.lumiFileVersion &&
+            (this.modelID === "lumi.airrtc.agl001" || this.modelID === "lumi.curtain.acn003" || this.modelID === "lumi.curtain.agl001")
+        ) {
+            // The current.fileVersion which comes from the device is wrong.
+            // Use the `lumiFileVersion` which comes from the manuSpecificLumi.attributeReport instead.
+            // https://github.com/Koenkk/zigbee2mqtt/issues/16345#issuecomment-1454835056
+            // https://github.com/Koenkk/zigbee2mqtt/issues/16345 doesn't seem to be needed for all
+            // https://github.com/Koenkk/zigbee2mqtt/issues/15745
+            current = {...current, fileVersion: this.meta.lumiFileVersion};
+        }
+
+        const meta = await this.findMatchingOtaImage(source, current, extraMetas);
+
+        if (!meta) {
+            // no image in repo/URL for specified device
+            return {
+                available: false,
+                current,
+            };
+        }
+
+        logger.debug(
+            () => `OTA ${source.downgrade ? "downgrade" : "upgrade"} image availability for ${this.ieeeAddr}, available=${JSON.stringify(meta)}`,
+            NS,
+        );
+
+        return {
+            available: meta.force ? true : source.downgrade ? current.fileVersion > meta.fileVersion : current.fileVersion < meta.fileVersion,
+            current,
+            availableMeta: meta,
+        };
+    }
+
+    async updateOta(
+        source: Readonly<OtaSource> | undefined,
+        requestPayload: TClusterCommandPayload<"genOta", "queryNextImageRequest"> | undefined,
+        requestTsn: number | undefined,
+        extraMetas: Readonly<OtaExtraMetas>,
+        onProgress: (progress: number, remaining: number) => void,
+        dataSettings: OtaDataSettings,
+        endpoint = this.endpoints.find((e) => e.supportsOutputCluster("genOta")),
+    ): Promise<[from: OtaUpdateAvailableResult["current"], to: OtaUpdateAvailableResult["current"] | undefined]> {
+        assert(this.#otaInProgress === false, `OTA already in progress for ${this.ieeeAddr}`);
+        assert(endpoint !== undefined, `No endpoint found with OTA cluster support for ${this.ieeeAddr}`);
+
+        if (source === undefined) {
+            assert(this.#scheduledOta !== undefined, `No currently scheduled OTA for ${this.ieeeAddr}`);
+
+            source = this.#scheduledOta;
+        }
+
+        this.#otaInProgress = true;
+
+        // always expected both undefined if one is, but just in case
+        if (requestPayload === undefined || requestTsn === undefined) {
+            try {
+                [requestPayload, requestTsn] = await this.#notifyOta(endpoint);
+            } finally {
+                this.#otaInProgress = false;
+            }
+        }
+
+        let available: OtaUpdateAvailableResult["available"] = false;
+        let image: OtaImage | undefined;
+
+        if (source.url && !source.url.endsWith(".json")) {
+            // firmware file at `source.url`
+            try {
+                const downloadedFile = await getOtaFirmware(source.url, undefined);
+                image = parseOtaImage(downloadedFile);
+                available = source.downgrade
+                    ? requestPayload.fileVersion > image.header.fileVersion
+                    : requestPayload.fileVersion < image.header.fileVersion;
+
+                logger.debug(
+                    () =>
+                        // biome-ignore lint/style/noNonNullAssertion: valid from above, won't change after assignment
+                        `Parsed image from '${source.url}' for ${this.ieeeAddr}, header=${JSON.stringify(image!.header)}`,
+                    NS,
+                );
+            } catch (error) {
+                logger.error(`Failed to parse OTA image from '${source.url}' for ${this.ieeeAddr}, aborting (${(error as Error).message})`, NS);
+                // biome-ignore lint/style/noNonNullAssertion: expected valid
+                logger.debug((error as Error).stack!, NS);
+            }
+        } else {
+            let availableMeta: OtaUpdateAvailableResult["availableMeta"];
+
+            try {
+                // index file at `source.url` (or undefined to use defaults)
+                ({available, availableMeta} = await this.checkOta(source, requestPayload, extraMetas, endpoint));
+            } finally {
+                this.#otaInProgress = false;
+            }
+
+            if (available && availableMeta) {
+                try {
+                    const downloadedFile = await getOtaFirmware(availableMeta.url, availableMeta.sha512);
+                    image = parseOtaImage(downloadedFile);
+
+                    logger.debug(
+                        () =>
+                            // biome-ignore lint/style/noNonNullAssertion: valid from above, won't change after assignment
+                            `Parsed image from '${availableMeta.url}' for ${this.ieeeAddr}, header=${JSON.stringify(image!.header)}`,
+                        NS,
+                    );
+                } catch (error) {
+                    logger.error(`Failed to parse OTA image for ${this.ieeeAddr}, aborting (${(error as Error).message})`, NS);
+                    // biome-ignore lint/style/noNonNullAssertion: expected valid
+                    logger.debug((error as Error).stack!, NS);
+                }
+            } else {
+                logger.info(() => `No OTA ${source.downgrade ? "downgrade" : "upgrade"} image currently available for ${this.ieeeAddr}`, NS);
+            }
+        }
+
+        // reply to `queryNextImageRequest` now that we have the data for it, should trigger image block/page request from device
+        // NOTE: previous code had try/catch wrapping with ignored error, but that doesn't look good (would fail to start OTA from device side)
+        try {
+            await endpoint.commandResponse(
+                "genOta",
+                "queryNextImageResponse",
+                image && available
+                    ? {
+                          status: Zcl.Status.SUCCESS,
+                          manufacturerCode: image.header.manufacturerCode,
+                          imageType: image.header.imageType,
+                          fileVersion: image.header.fileVersion,
+                          imageSize: image.header.totalImageSize,
+                      }
+                    : {status: Zcl.Status.NO_IMAGE_AVAILABLE},
+                undefined,
+                requestTsn,
+            );
+        } finally {
+            this.#otaInProgress = false;
+        }
+
+        if (!image || !available) {
+            this.#otaInProgress = false;
+
+            return [requestPayload, undefined];
+        }
+
+        logger.debug(() => `Starting OTA update for ${this.ieeeAddr}`, NS);
+
+        const session = new OtaSession(this.ieeeAddr, endpoint, image, onProgress, dataSettings, this.#waitForOtaCommand.bind(this));
+
+        let endResult: TZclFrame<"genOta", "upgradeEndRequest">;
+
+        try {
+            this.#otaAbortController = new AbortController();
+            const runEnd = await session.run(this.#otaAbortController.signal);
+
+            assert(runEnd.header.isSpecific);
+
+            endResult = runEnd as TZclFrame<"genOta", "upgradeEndRequest">;
+        } finally {
+            this.#otaInProgress = false;
+            this.#otaAbortController = undefined;
+        }
+
+        logger.debug(() => `Received upgrade end request for ${this.ieeeAddr}: ${JSON.stringify(endResult.payload)}`, NS);
+
+        if (endResult.payload.status === Zcl.Status.SUCCESS) {
+            try {
+                await endpoint.commandResponse(
+                    "genOta",
+                    "upgradeEndResponse",
+                    {
+                        manufacturerCode: image.header.manufacturerCode,
+                        imageType: image.header.imageType,
+                        fileVersion: image.header.fileVersion,
+                        // using 0 tells the device to use `upgradeTime` as offset (11.13.8.2.8), preventing issues with UTC Time support
+                        currentTime: 0,
+                        upgradeTime: 1,
+                    },
+                    undefined,
+                    endResult.header.transactionSequenceNumber,
+                );
+
+                onProgress(100, 0);
+                logger.info(
+                    () =>
+                        `Update of ${this.ieeeAddr} successful (${Math.round((performance.now() - session.startTime) / 1000)} seconds). Waiting for device announce...`,
+                    NS,
+                );
+
+                let timer: NodeJS.Timeout;
+
+                await new Promise<void>((resolve) => {
+                    const onDeviceAnnounce = () => {
+                        clearTimeout(timer);
+                        logger.debug(() => `Received device announce for ${this.ieeeAddr}, OTA update finished.`, NS);
+                        resolve();
+                    };
+
+                    // force "finished" after given time
+                    timer = setTimeout(() => {
+                        this.removeListener("deviceAnnounce", onDeviceAnnounce);
+                        logger.debug(() => `Timed out waiting for device announce for ${this.ieeeAddr}, OTA update considered finished.`, NS);
+                        resolve();
+                    }, 120000 /** consider "done" after timeout even if no announce seen */);
+
+                    this.once("deviceAnnounce", onDeviceAnnounce);
+                });
+
+                // only "cancel" possible scheduled OTA when successful
+                this.#scheduledOta = undefined;
+                this.#otaInProgress = false;
+
+                return [
+                    requestPayload,
+                    {
+                        fieldControl: 0,
+                        manufacturerCode: image.header.manufacturerCode,
+                        imageType: image.header.imageType,
+                        fileVersion: image.header.fileVersion,
+                    },
+                ];
+            } catch (error) {
+                this.#otaInProgress = false;
+
+                throw new Error(`OTA upgrade end response failed: ${(error as Error).message}`);
+            }
+        } else {
+            /**
+             * For other status value received such as INVALID_IMAGE, REQUIRE_MORE_IMAGE, or ABORT,
+             * the upgrade server SHALL not send Upgrade End Response command but it SHALL send default
+             * response command with status of success and it SHALL wait for the client to reinitiate the upgrade process.
+             */
+            try {
+                await endpoint.defaultResponse(
+                    Zcl.Clusters.genOta.commands.upgradeEndRequest.ID,
+                    Zcl.Status.SUCCESS,
+                    GEN_OTA_CLUSTER_ID,
+                    endResult.header.transactionSequenceNumber,
+                );
+            } catch (error) {
+                logger.debug(() => `OTA upgrade end request default response for ${this.ieeeAddr} failed: ${(error as Error).message}`, NS);
+            }
+
+            this.#otaInProgress = false;
+
+            throw new Error(`OTA update of ${this.ieeeAddr} failed with reason: ${Zcl.Status[endResult.payload.status]}`);
+        }
+    }
+
+    /**
+     * Abort running OTA if any. Send `ABORT` with next block response to device.
+     */
+    abortOta(): void {
+        this.#otaAbortController?.abort();
+    }
+
+    scheduleOta(source: OtaSource): void {
+        assert(
+            this.endpoints.some((e) => e.supportsOutputCluster("genOta")),
+            `No endpoint found with OTA cluster support for ${this.ieeeAddr}`,
+        );
+
+        if (this.#scheduledOta) {
+            logger.info(`Previously scheduled OTA update for '${this.ieeeAddr}' was cancelled in favor of new schedule request`, NS);
+        }
+
+        this.#scheduledOta = source;
+
+        logger.info(`Scheduled OTA update for '${this.ieeeAddr}' on next request from device`, NS);
+    }
+
+    unscheduleOta(): void {
+        if (this.#scheduledOta !== undefined) {
+            this.#scheduledOta = undefined;
+
+            logger.info(`Previously scheduled OTA update for '${this.ieeeAddr}' was cancelled`, NS);
+        }
     }
 }
 

@@ -6,6 +6,7 @@ import {BroadcastAddress} from "../../zspec/enums";
 import type {Eui64} from "../../zspec/tstypes";
 import * as Zcl from "../../zspec/zcl";
 import type {TFoundation} from "../../zspec/zcl/definition/clusters-types";
+import type {FoundationDefinition} from "../../zspec/zcl/definition/foundation";
 import type * as ZclTypes from "../../zspec/zcl/definition/tstype";
 import * as Zdo from "../../zspec/zdo";
 import Request from "../helpers/request";
@@ -34,7 +35,12 @@ export interface ConfigureReportingItem<Cl extends string | number, Custom exten
     attribute: ClusterOrRawAttributeKeys<Cl, Custom>[number] | {ID: number; type: number};
     minimumReportInterval: number;
     maximumReportInterval: number;
-    reportableChange: number;
+    reportableChange?: number;
+}
+
+export interface ReadReportConfigItem<Cl extends string | number, Custom extends TCustomCluster | undefined = undefined> {
+    direction?: Zcl.Direction;
+    attribute: ClusterOrRawAttributeKeys<Cl, Custom>[number] | {ID: number};
 }
 
 interface Options {
@@ -62,13 +68,13 @@ interface OptionsWithDefaults extends Options {
     writeUndiv: boolean;
 }
 
-interface Clusters {
+export interface Clusters {
     [cluster: string]: {
         attributes: {[attribute: string]: number | string};
     };
 }
 
-interface BindInternal {
+export interface BindInternal {
     cluster: number;
     type: "endpoint" | "group";
     deviceIeeeAddress?: string;
@@ -136,7 +142,7 @@ export class Endpoint extends ZigbeeEntity {
 
         return this._configuredReportings.map((entry, index) => {
             const cluster = Zcl.Utils.getCluster(entry.cluster, entry.manufacturerCode, device.customClusters);
-            const attribute: ZclTypes.Attribute = cluster.getAttribute(entry.attrId) ?? {
+            const attribute: ZclTypes.Attribute = Zcl.Utils.getClusterAttribute(cluster, entry.attrId, entry.manufacturerCode) ?? {
                 ID: entry.attrId,
                 name: `attr${index}`,
                 type: Zcl.DataType.UNKNOWN,
@@ -219,18 +225,14 @@ export class Endpoint extends ZigbeeEntity {
      * @returns {ZclTypes.Cluster[]}
      */
     public getInputClusters(): ZclTypes.Cluster[] {
-        return this.clusterNumbersToClusters(this.inputClusters);
+        return this.inputClusters.map((c) => this.getCluster(c));
     }
 
     /**
      * @returns {ZclTypes.Cluster[]}
      */
     public getOutputClusters(): ZclTypes.Cluster[] {
-        return this.clusterNumbersToClusters(this.outputClusters);
-    }
-
-    private clusterNumbersToClusters(clusterNumbers: number[]): ZclTypes.Cluster[] {
-        return clusterNumbers.map((c) => this.getCluster(c));
+        return this.outputClusters.map((c) => this.getCluster(c));
     }
 
     /*
@@ -247,6 +249,22 @@ export class Endpoint extends ZigbeeEntity {
                 delete entry.attrs;
             }
         }
+
+        // Migrate cluster renames from https://github.com/Koenkk/zigbee-herdsman/pull/1503 @deprecated 3.0
+        /* v8 ignore start */
+        if (record.clusters.piRetailTunnel) {
+            record.clusters.retailTunnel = record.clusters.piRetailTunnel;
+            delete record.clusters.piRetailTunnel;
+        }
+        if (record.clusters.tunneling) {
+            record.clusters.seTunneling = record.clusters.tunneling;
+            delete record.clusters.tunneling;
+        }
+        if (record.clusters.haMeterIdentification) {
+            record.clusters.seMeterIdentification = record.clusters.haMeterIdentification;
+            delete record.clusters.haMeterIdentification;
+        }
+        /* v8 ignore stop */
 
         return new Endpoint(
             record.epId,
@@ -306,7 +324,7 @@ export class Endpoint extends ZigbeeEntity {
 
         if (this.clusters[cluster.name] && this.clusters[cluster.name].attributes) {
             // XXX: used to throw (behavior changed in #1455)
-            const attribute = cluster.getAttribute(attributeKey);
+            const attribute = Zcl.Utils.getClusterAttribute(cluster, attributeKey, undefined);
 
             if (attribute) {
                 return this.clusters[cluster.name].attributes[attribute.name];
@@ -314,6 +332,61 @@ export class Endpoint extends ZigbeeEntity {
         }
 
         return undefined;
+    }
+
+    public saveClusterAttributeReportConfig(
+        clusterId: number,
+        manufacturerCode: Zcl.ManufacturerCode | undefined,
+        reportConfigs: TFoundation["readReportConfigRsp"],
+    ): void {
+        for (const entry of reportConfigs) {
+            if (entry.direction === Zcl.Direction.SERVER_TO_CLIENT) {
+                continue;
+            }
+
+            const existingConfigIdx = this._configuredReportings.findIndex(
+                (r) =>
+                    r.cluster === clusterId &&
+                    r.attrId === entry.attrId &&
+                    (manufacturerCode === undefined || manufacturerCode === r.manufacturerCode),
+            );
+
+            if (entry.status === Zcl.Status.SUCCESS) {
+                if (existingConfigIdx > -1) {
+                    this._configuredReportings[existingConfigIdx].minRepIntval = entry.minRepIntval as number;
+                    this._configuredReportings[existingConfigIdx].maxRepIntval = entry.maxRepIntval as number;
+                    this._configuredReportings[existingConfigIdx].repChange = entry.repChange as number;
+                } else {
+                    this._configuredReportings.push({
+                        cluster: clusterId,
+                        attrId: entry.attrId,
+                        minRepIntval: entry.minRepIntval as number,
+                        maxRepIntval: entry.maxRepIntval as number,
+                        repChange: entry.repChange as number,
+                        manufacturerCode,
+                    });
+                }
+            } else {
+                // UNSUPPORTED_ATTRIBUTE, UNREPORTABLE_ATTRIBUTE, NOT_FOUND
+                if (existingConfigIdx > -1) {
+                    this._configuredReportings.splice(existingConfigIdx, 1);
+                }
+            }
+        }
+
+        this.save();
+    }
+
+    public saveBindings(binds: BindInternal[]): void {
+        this._binds = binds;
+
+        this.save();
+    }
+
+    public clearBindings(): void {
+        this._binds.length = 0;
+
+        this.save();
     }
 
     public hasPendingRequests(): boolean {
@@ -393,8 +466,10 @@ export class Endpoint extends ZigbeeEntity {
         const cluster = this.getCluster(clusterKey, undefined, options?.manufacturerCode);
         const payload: TFoundation["report"] = [];
 
+        // TODO: handle `attr.report !== true`
+
         for (const nameOrID in attributes) {
-            const attribute = cluster.getAttribute(nameOrID);
+            const attribute = Zcl.Utils.getClusterAttribute(cluster, nameOrID, options?.manufacturerCode);
 
             if (attribute) {
                 payload.push({attrId: attribute.ID, attrData: attributes[nameOrID], dataType: attribute.type});
@@ -426,10 +501,13 @@ export class Endpoint extends ZigbeeEntity {
         const payload: TFoundation["write"] = [];
 
         for (const nameOrID in attributes) {
-            const attribute = cluster.getAttribute(nameOrID);
+            const attribute = Zcl.Utils.getClusterAttribute(cluster, nameOrID, options?.manufacturerCode);
 
             if (attribute) {
-                payload.push({attrId: attribute.ID, attrData: attributes[nameOrID], dataType: attribute.type});
+                // TODO: handle `attr.writeOptional !== true`
+                const attrData = Zcl.Utils.processAttributeWrite(attribute, attributes[nameOrID]);
+
+                payload.push({attrId: attribute.ID, attrData, dataType: attribute.type});
             } else if (!Number.isNaN(Number(nameOrID))) {
                 const value = attributes[nameOrID];
 
@@ -458,7 +536,7 @@ export class Endpoint extends ZigbeeEntity {
             const value = attributes[nameOrID]!;
 
             if (value.status !== undefined) {
-                const attribute = cluster.getAttribute(nameOrID);
+                const attribute = Zcl.Utils.getClusterAttribute(cluster, nameOrID, options?.manufacturerCode);
 
                 if (attribute) {
                     payload.push({attrId: attribute.ID, status: value.status});
@@ -498,13 +576,16 @@ export class Endpoint extends ZigbeeEntity {
         );
         const payload: TFoundation["read"] = [];
 
+        // TODO: handle `attr.required !== true` => should not throw
+
         for (const attribute of attributes) {
             if (typeof attribute === "number") {
                 payload.push({attrId: attribute});
             } else {
-                const attr = cluster.getAttribute(attribute);
+                const attr = Zcl.Utils.getClusterAttribute(cluster, attribute, options?.manufacturerCode);
 
                 if (attr) {
+                    Zcl.Utils.processAttributePreRead(attr);
                     payload.push({attrId: attr.ID});
                 } else {
                     logger.warning(`Ignoring unknown attribute ${attribute} in cluster ${cluster.name}`, NS);
@@ -512,6 +593,7 @@ export class Endpoint extends ZigbeeEntity {
             }
         }
 
+        // TODO: could be sending empty array payload
         const resultFrame = await this.zclCommand(cluster, "read", payload, optionsWithDefaults, attributes, true);
 
         return resultFrame
@@ -519,6 +601,10 @@ export class Endpoint extends ZigbeeEntity {
             : ({} as ClusterOrRawWriteAttributes<Cl, Custom>);
     }
 
+    /**
+     * Sends a Foundation response to a read request.
+     * Any attribute with an `undefined` value will result in a sent record with status `UNSUPPORTED_ATTRIBUTE`
+     */
     public async readResponse<Cl extends number | string, Custom extends TCustomCluster | undefined = undefined>(
         clusterKey: Cl,
         transactionSequenceNumber: number,
@@ -531,14 +617,25 @@ export class Endpoint extends ZigbeeEntity {
         const payload: TFoundation["readRsp"] = [];
 
         for (const nameOrID in attributes) {
-            const attribute = cluster.getAttribute(nameOrID);
+            const attribute = Zcl.Utils.getClusterAttribute(cluster, nameOrID, options?.manufacturerCode);
 
             if (attribute) {
-                payload.push({attrId: attribute.ID, attrData: attributes[nameOrID], dataType: attribute.type, status: 0});
+                const attrData = attributes[nameOrID];
+
+                if (attrData === undefined) {
+                    payload.push({attrId: attribute.ID, status: Zcl.Status.UNSUPPORTED_ATTRIBUTE});
+                } else {
+                    payload.push({attrId: attribute.ID, attrData, dataType: attribute.type, status: Zcl.Status.SUCCESS});
+                }
             } else if (!Number.isNaN(Number(nameOrID))) {
                 const value = attributes[nameOrID];
+                const attrData = value.value;
 
-                payload.push({attrId: Number(nameOrID), attrData: value.value, dataType: value.type, status: 0});
+                if (attrData === undefined) {
+                    payload.push({attrId: Number(nameOrID), status: Zcl.Status.UNSUPPORTED_ATTRIBUTE});
+                } else {
+                    payload.push({attrId: Number(nameOrID), attrData, dataType: value.type, status: Zcl.Status.SUCCESS});
+                }
             } else {
                 throw new Error(`Unknown attribute '${nameOrID}', specify either an existing attribute or a number`);
             }
@@ -548,7 +645,7 @@ export class Endpoint extends ZigbeeEntity {
             cluster,
             "readRsp",
             payload,
-            {direction: Zcl.Direction.SERVER_TO_CLIENT, ...options, transactionSequenceNumber},
+            {direction: Zcl.Direction.SERVER_TO_CLIENT, disableDefaultResponse: true, ...options, transactionSequenceNumber},
             attributes,
         );
     }
@@ -651,25 +748,26 @@ export class Endpoint extends ZigbeeEntity {
         this.getDevice().save();
     }
 
-    public async unbind(clusterKey: number | string, target: Endpoint | Group | number): Promise<void> {
+    public async unbind(clusterKey: number | string, target: Endpoint | Group | number, force = false): Promise<void> {
+        // When force is true the unbind is done even when the bind is not in the bind list, additionally when the target is a number
+        // it will not check if the group exists.
         const cluster = this.getCluster(clusterKey);
         const action = `Unbind ${this.deviceIeeeAddress}/${this.ID} ${cluster.name}`;
 
         if (typeof target === "number") {
             const groupTarget = Group.byGroupID(target);
-
-            if (!groupTarget) {
+            if (groupTarget) {
+                target = groupTarget;
+            } else if (!force) {
                 throw new Error(`${action} invalid target '${target}' (no group with this ID exists).`);
             }
-
-            target = groupTarget;
         }
 
-        const destinationAddress = target instanceof Endpoint ? target.deviceIeeeAddress : target.groupID;
+        const destinationAddress = target instanceof Endpoint ? target.deviceIeeeAddress : target instanceof Group ? target.groupID : target;
         const log = `${action} from '${target instanceof Endpoint ? `${destinationAddress}/${target.ID}` : destinationAddress}'`;
-        const index = this.getBindIndex(cluster.ID, target);
+        const index = target instanceof Endpoint || target instanceof Group ? this.getBindIndex(cluster.ID, target) : -1;
 
-        if (index === -1) {
+        if (index === -1 && !force) {
             logger.debug(`${log} no bind present, skipping.`, NS);
             return;
         }
@@ -686,7 +784,7 @@ export class Endpoint extends ZigbeeEntity {
                 cluster.ID,
                 target instanceof Endpoint ? Zdo.UNICAST_BINDING : Zdo.MULTICAST_BINDING,
                 target instanceof Endpoint ? (target.deviceIeeeAddress as Eui64) : ZSpec.BLANK_EUI64,
-                target instanceof Group ? target.groupID : 0,
+                target instanceof Group ? target.groupID : typeof target === "number" ? target : 0,
                 target instanceof Endpoint ? target.ID : 0xff,
             );
 
@@ -700,8 +798,10 @@ export class Endpoint extends ZigbeeEntity {
                 }
             }
 
-            this._binds.splice(index, 1);
-            this.save();
+            if (index !== -1) {
+                this._binds.splice(index, 1);
+                this.save();
+            }
         } catch (error) {
             const err = error as Error;
             err.message = `${log} failed (${err.message})`;
@@ -745,7 +845,7 @@ export class Endpoint extends ZigbeeEntity {
                 dataType = item.attribute.type;
                 attrId = item.attribute.ID;
             } else {
-                const attribute = cluster.getAttribute(item.attribute);
+                const attribute = Zcl.Utils.getClusterAttribute(cluster, item.attribute, optionsWithDefaults.manufacturerCode);
 
                 if (attribute) {
                     dataType = attribute.type;
@@ -795,6 +895,49 @@ export class Endpoint extends ZigbeeEntity {
         this.save();
     }
 
+    public async readReportingConfig<Cl extends number | string, Custom extends TCustomCluster | undefined = undefined>(
+        clusterKey: Cl,
+        items: ReadReportConfigItem<Cl, Custom>[],
+        options?: Options,
+    ): Promise<TFoundation["readReportConfigRsp"]> {
+        const cluster = this.getCluster(clusterKey, undefined, options?.manufacturerCode);
+        const optionsWithDefaults = this.getOptionsWithDefaults(options, true, Zcl.Direction.CLIENT_TO_SERVER, cluster.manufacturerCode);
+        optionsWithDefaults.manufacturerCode = this.ensureManufacturerCodeIsUniqueAndGet<Cl, Custom>(
+            cluster,
+            items,
+            optionsWithDefaults.manufacturerCode,
+            "readReportingConfig",
+        );
+
+        const payload: TFoundation["readReportConfig"] = [];
+
+        for (const item of items) {
+            if (typeof item.attribute === "object") {
+                payload.push({direction: item.direction ?? Zcl.Direction.CLIENT_TO_SERVER, attrId: item.attribute.ID});
+            } else {
+                const attribute = Zcl.Utils.getClusterAttribute(cluster, item.attribute, optionsWithDefaults.manufacturerCode);
+
+                if (attribute) {
+                    payload.push({direction: item.direction ?? Zcl.Direction.CLIENT_TO_SERVER, attrId: attribute.ID});
+                } else {
+                    logger.warning(`Ignoring unknown attribute ${item.attribute} in cluster ${cluster.name}`, NS);
+                }
+            }
+        }
+
+        // TODO: could be sending empty array payload
+        // don't check status otherwise whole command fails (we want to cherry-pick here)
+        const response = await this.zclCommand(cluster, "readReportConfig", payload, optionsWithDefaults, items, false);
+
+        if (response) {
+            this.saveClusterAttributeReportConfig(response.cluster.ID, optionsWithDefaults.manufacturerCode, response.payload);
+
+            return response.payload;
+        }
+
+        throw new Error("No response received");
+    }
+
     public async writeStructured<Cl extends number | string>(
         clusterKey: Cl,
         payload: TFoundation["writeStructured"],
@@ -827,7 +970,7 @@ export class Endpoint extends ZigbeeEntity {
 
         const device = this.getDevice();
         const cluster = this.getCluster(clusterKey, device, options?.manufacturerCode);
-        const command = cluster.getCommandResponse(commandKey);
+        const command = Zcl.Utils.getClusterCommandResponse(cluster, commandKey);
         transactionSequenceNumber = transactionSequenceNumber ?? zclTransactionSequenceNumber.next();
         const optionsWithDefaults = this.getOptionsWithDefaults(options, true, Zcl.Direction.SERVER_TO_CLIENT, cluster.manufacturerCode);
 
@@ -867,43 +1010,6 @@ export class Endpoint extends ZigbeeEntity {
         }
     }
 
-    public waitForCommand(
-        clusterKey: number | string,
-        commandKey: number | string,
-        transactionSequenceNumber: number | undefined,
-        timeout: number,
-    ): {promise: Promise<{header: Zcl.Header; payload: KeyValue}>; cancel: () => void} {
-        const device = this.getDevice();
-        const cluster = this.getCluster(clusterKey, device);
-        const command = cluster.getCommand(commandKey);
-        const waiter = Entity.adapter.waitFor(
-            this.deviceNetworkAddress,
-            this.ID,
-            Zcl.FrameType.SPECIFIC,
-            Zcl.Direction.CLIENT_TO_SERVER,
-            transactionSequenceNumber,
-            cluster.ID,
-            command.ID,
-            timeout,
-        );
-
-        const promise = new Promise<{header: Zcl.Header; payload: KeyValue}>((resolve, reject) => {
-            waiter.promise.then(
-                (payload) => {
-                    try {
-                        const frame = Zcl.Frame.fromBuffer(payload.clusterID, payload.header, payload.data, device.customClusters);
-                        resolve({header: frame.header, payload: frame.payload});
-                    } catch (error) {
-                        reject(error);
-                    }
-                },
-                (error) => reject(error),
-            );
-        });
-
-        return {promise, cancel: waiter.cancel};
-    }
-
     private getOptionsWithDefaults(
         options: Options | undefined,
         disableDefaultResponse: boolean,
@@ -927,47 +1033,73 @@ export class Endpoint extends ZigbeeEntity {
 
     private ensureManufacturerCodeIsUniqueAndGet<Cl extends string | number, Custom extends TCustomCluster | undefined = undefined>(
         cluster: ZclTypes.Cluster,
-        attributes: (string | number)[] | ConfigureReportingItem<Cl, Custom>[],
+        attributes: (string | number)[] | ConfigureReportingItem<Cl, Custom>[] | ReadReportConfigItem<Cl, Custom>[],
         fallbackManufacturerCode: number | undefined, // XXX: problematic undefined for a "fallback"?
         caller: string,
     ): number | undefined {
-        const manufacturerCodes = new Set(
-            attributes.map((nameOrID): number | undefined => {
-                let attributeID: number | string;
+        let firstManufacturerCode: number | undefined;
+        let codeSet = false;
 
-                if (typeof nameOrID === "object") {
-                    // ConfigureReportingItem
-                    if (typeof nameOrID.attribute !== "object") {
-                        attributeID = nameOrID.attribute;
-                    } else {
-                        return fallbackManufacturerCode;
-                    }
+        for (const nameOrID of attributes) {
+            let attributeID: number | string;
+
+            if (typeof nameOrID === "object") {
+                // ConfigureReportingItem
+                if (typeof nameOrID.attribute !== "object") {
+                    attributeID = nameOrID.attribute;
                 } else {
-                    // string || number
-                    attributeID = nameOrID;
+                    if (!codeSet) {
+                        firstManufacturerCode = fallbackManufacturerCode;
+                        codeSet = true;
+                    } else if (firstManufacturerCode !== fallbackManufacturerCode) {
+                        throw new Error(`Cannot have attributes with different manufacturerCode in single '${caller}' call`);
+                    }
+
+                    continue;
                 }
+            } else {
+                // string || number
+                attributeID = nameOrID;
+            }
 
-                // we fall back to caller|cluster provided manufacturerCode
-                const attribute = cluster.getAttribute(attributeID);
+            // we fall back to caller|cluster provided manufacturerCode
+            const attribute = Zcl.Utils.getClusterAttribute(cluster, attributeID, undefined);
+            const manufacturerCode = attribute
+                ? attribute.manufacturerCode === undefined
+                    ? fallbackManufacturerCode
+                    : attribute.manufacturerCode
+                : fallbackManufacturerCode;
 
-                if (attribute) {
-                    return attribute.manufacturerCode === undefined ? fallbackManufacturerCode : attribute.manufacturerCode;
-                }
-
-                // unknown attribute, we should not fail on this here
-                return fallbackManufacturerCode;
-            }),
-        );
-
-        if (manufacturerCodes.size === 1) {
-            return manufacturerCodes.values().next().value;
+            if (!codeSet) {
+                firstManufacturerCode = manufacturerCode;
+                codeSet = true;
+            } else if (firstManufacturerCode !== manufacturerCode) {
+                throw new Error(`Cannot have attributes with different manufacturerCode in single '${caller}' call`);
+            }
         }
 
-        throw new Error(`Cannot have attributes with different manufacturerCode in single '${caller}' call`);
+        return firstManufacturerCode;
     }
 
     public async addToGroup(group: Group): Promise<void> {
-        await this.command("genGroups", "add", {groupid: group.groupID, groupname: ""});
+        const response = await this.zclCommand(
+            "genGroups",
+            "add",
+            {groupid: group.groupID, groupname: ""},
+            undefined,
+            undefined,
+            true,
+            Zcl.FrameType.SPECIFIC,
+        );
+
+        if (response?.payload.status !== undefined) {
+            if (response.payload.status === Zcl.Status.DUPLICATE_EXISTS) {
+                logger.info(`Group '${response.payload.groupid}' already exists on endpoint '${this.deviceIeeeAddress}/${this.ID}'`, NS);
+            } else if (response.payload.status !== Zcl.Status.SUCCESS) {
+                throw new Zcl.StatusError(response.payload.status);
+            }
+        }
+
         group.addMember(this);
     }
 
@@ -989,14 +1121,29 @@ export class Endpoint extends ZigbeeEntity {
      * to zigbee-herdsman.
      */
     public async removeFromGroup(group: Group | number): Promise<void> {
-        await this.command("genGroups", "remove", {groupid: group instanceof Group ? group.groupID : group});
+        const response = await this.zclCommand(
+            "genGroups",
+            "remove",
+            {groupid: group instanceof Group ? group.groupID : group},
+            undefined,
+            undefined,
+            true,
+            Zcl.FrameType.SPECIFIC,
+        );
+
+        if (response?.payload.status === Zcl.Status.NOT_FOUND) {
+            logger.info(`Group '${response.payload.groupid}' was not found on endpoint '${this.deviceIeeeAddress}/${this.ID}'`, NS);
+        } else if (response?.payload.status !== undefined && response.payload.status !== Zcl.Status.SUCCESS) {
+            throw new Zcl.StatusError(response.payload.status);
+        }
+
         if (group instanceof Group) {
             group.removeMember(this);
         }
     }
 
     public async removeFromAllGroups(): Promise<void> {
-        await this.command("genGroups", "removeAll", {}, {disableDefaultResponse: true});
+        await this.zclCommand("genGroups", "removeAll", {}, {disableDefaultResponse: true}, undefined, false, Zcl.FrameType.SPECIFIC);
         this.removeFromAllGroupsDatabase();
     }
 
@@ -1010,7 +1157,7 @@ export class Endpoint extends ZigbeeEntity {
 
     public async zclCommand<Cl extends number | string, Co extends number | string, Custom extends TCustomCluster | undefined = undefined>(
         clusterKey: Cl | ZclTypes.Cluster,
-        commandKey: Co | ZclTypes.Command,
+        commandKey: Co | ZclTypes.Command | FoundationDefinition,
         payload: ClusterOrRawPayload<Cl, Co, Custom> | FoundationOrRawPayload<Co>,
         options?: Options,
         logPayload?: KeyValue,
@@ -1024,7 +1171,7 @@ export class Endpoint extends ZigbeeEntity {
                 ? commandKey
                 : frameType === Zcl.FrameType.GLOBAL
                   ? Zcl.Utils.getGlobalCommand(commandKey)
-                  : cluster.getCommand(commandKey);
+                  : Zcl.Utils.getClusterCommand(cluster, commandKey);
         const hasResponse = frameType === Zcl.FrameType.GLOBAL ? true : command.response !== undefined;
         const optionsWithDefaults = this.getOptionsWithDefaults(options, hasResponse, Zcl.Direction.CLIENT_TO_SERVER, cluster.manufacturerCode);
 
@@ -1075,7 +1222,7 @@ export class Endpoint extends ZigbeeEntity {
     ): Promise<void> {
         const device = this.getDevice();
         const cluster = this.getCluster(clusterKey, device, options?.manufacturerCode);
-        const command = cluster.getCommand(commandKey);
+        const command = Zcl.Utils.getClusterCommand(cluster, commandKey);
         const optionsWithDefaults = this.getOptionsWithDefaults(options, true, Zcl.Direction.CLIENT_TO_SERVER, cluster.manufacturerCode);
         const sourceEndpoint = optionsWithDefaults.srcEndpoint ?? this.ID;
 

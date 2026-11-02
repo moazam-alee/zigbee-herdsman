@@ -8,7 +8,7 @@ import type {BroadcastAddress} from "../../../zspec/enums";
 import * as Zcl from "../../../zspec/zcl";
 import * as Zdo from "../../../zspec/zdo";
 import type * as ZdoTypes from "../../../zspec/zdo/definition/tstypes";
-import Adapter from "../../adapter";
+import Adapter, {type ClusterWaitressMatcher, type ZclWaitressPayload} from "../../adapter";
 import type * as Events from "../../events";
 import type * as TsType from "../../tstype";
 import type {RawAPSDataRequestPayload} from "../driver/commandType";
@@ -19,47 +19,34 @@ import {patchZdoBuffaloBE} from "./patchZdoBuffaloBE";
 
 const NS = "zh:zigate";
 const default_bind_group = 901; // https://github.com/Koenkk/zigbee-herdsman-converters/blob/master/lib/constants.js#L3
-interface WaitressMatcher {
-    address?: number | string;
-    endpoint: number;
-    transactionSequenceNumber?: number;
-    frameType: Zcl.FrameType;
-    clusterID: number;
-    commandIdentifier: number;
-    direction: number;
-}
 
 export class ZiGateAdapter extends Adapter {
     private driver: Driver;
     private joinPermitted: boolean;
-    private waitress: Waitress<Events.ZclPayload, WaitressMatcher>;
-    private closing: boolean;
+    private waitress: Waitress<ZclWaitressPayload, ClusterWaitressMatcher>;
     private queue: Queue;
 
     public constructor(
         networkOptions: TsType.NetworkOptions,
-        serialPortOptions: TsType.SerialPortOptions,
+        transportOptions: TsType.TransportOptions,
         backupPath: string,
         adapterOptions: TsType.AdapterOptions,
     ) {
         patchZdoBuffaloBE();
-        super(networkOptions, serialPortOptions, backupPath, adapterOptions);
+        super(networkOptions, transportOptions, backupPath, adapterOptions);
         this.hasZdoMessageOverhead = false; // false for requests, true for responses
         this.manufacturerID = Zcl.ManufacturerCode.RESERVED_10;
 
         this.joinPermitted = false;
-        this.closing = false;
         const concurrent = this.adapterOptions?.concurrent ? this.adapterOptions.concurrent : 2;
         logger.debug(`Adapter concurrent: ${concurrent}`, NS);
         this.queue = new Queue(concurrent);
-        // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-        this.driver = new Driver(serialPortOptions.path!, serialPortOptions);
-        this.waitress = new Waitress<Events.ZclPayload, WaitressMatcher>(this.waitressValidator, this.waitressTimeoutFormatter);
+        this.driver = new Driver(this.transport);
+        this.waitress = new Waitress(Adapter.zclWaitressValidator, Adapter.clusterWaitressTimeoutFormatter);
 
         this.driver.on("received", this.dataListener.bind(this));
         this.driver.on("LeaveIndication", this.leaveIndicationListener.bind(this));
         this.driver.on("DeviceAnnounce", this.deviceAnnounceListener.bind(this));
-        this.driver.on("close", this.onZiGateClose.bind(this));
         this.driver.on("zdoResponse", this.onZdoResponse.bind(this));
     }
 
@@ -69,7 +56,7 @@ export class ZiGateAdapter extends Adapter {
     public async start(): Promise<TsType.StartResult> {
         let startResult: TsType.StartResult = "resumed";
         try {
-            await this.driver.open();
+            await this.transport.open(true);
             logger.info("Connected to ZiGate adapter successfully.", NS);
 
             const resetResponse = await this.driver.sendCommand(ZiGateCommandCode.Reset, {}, 5000);
@@ -104,7 +91,6 @@ export class ZiGateAdapter extends Adapter {
     }
 
     public async stop(): Promise<void> {
-        this.closing = true;
         await this.driver.close();
     }
 
@@ -357,6 +343,7 @@ export class ZiGateAdapter extends Adapter {
                 zclFrame.header.transactionSequenceNumber,
                 zclFrame.cluster.ID,
                 command.response,
+                undefined,
                 timeout,
             );
         } else if (!zclFrame.header.frameControl.disableDefaultResponse) {
@@ -368,6 +355,7 @@ export class ZiGateAdapter extends Adapter {
                 zclFrame.header.transactionSequenceNumber,
                 zclFrame.cluster.ID,
                 Zcl.Foundation.defaultRsp.ID,
+                undefined,
                 timeout,
             );
         }
@@ -518,24 +506,17 @@ export class ZiGateAdapter extends Adapter {
     }
 
     public waitFor(
-        networkAddress: number | undefined,
+        networkAddress: number,
         endpoint: number,
-        frameType: Zcl.FrameType,
-        direction: Zcl.Direction,
+        _frameType: Zcl.FrameType,
+        _direction: Zcl.Direction,
         transactionSequenceNumber: number | undefined,
-        clusterID: number,
-        commandIdentifier: number,
+        clusterId: number,
+        commandId: number,
+        defaultRspCommandId: number | undefined,
         timeout: number,
     ): {promise: Promise<Events.ZclPayload>; cancel: () => void} {
-        const payload = {
-            address: networkAddress,
-            endpoint,
-            clusterID,
-            commandIdentifier,
-            frameType,
-            direction,
-            transactionSequenceNumber,
-        };
+        const payload = {address: networkAddress, endpoint, clusterId, commandId, defaultRspCommandId, transactionSequenceNumber};
         const waiter = this.waitress.waitFor(payload, timeout);
         const cancel = (): void => this.waitress.remove(waiter.ID);
         return {promise: waiter.start().promise, cancel};
@@ -550,7 +531,13 @@ export class ZiGateAdapter extends Adapter {
     public async sendZclFrameInterPANToIeeeAddr(_zclFrame: Zcl.Frame, _ieeeAddress: string): Promise<void> {
         await Promise.reject(new Error("Not supported"));
     }
-    public async sendZclFrameInterPANBroadcast(_zclFrame: Zcl.Frame, _timeout: number): Promise<Events.ZclPayload> {
+    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number, disableResponse: false): Promise<Events.ZclPayload>;
+    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number, disableResponse: true): Promise<undefined>;
+    public async sendZclFrameInterPANBroadcast(
+        _zclFrame: Zcl.Frame,
+        _timeout: number,
+        _disableResponse: boolean,
+    ): Promise<Events.ZclPayload | undefined> {
         return await Promise.reject(new Error("Not supported"));
     }
 
@@ -585,7 +572,11 @@ export class ZiGateAdapter extends Adapter {
             wasBroadcast: false, // TODO
             destinationEndpoint: <number>ziGateObject.payload.destinationEndpoint,
         };
-        this.waitress.resolve(payload);
+
+        if (payload.header !== undefined) {
+            this.waitress.resolve(payload as ZclWaitressPayload);
+        }
+
         this.emit("zclPayload", payload);
     }
 
@@ -596,32 +587,5 @@ export class ZiGateAdapter extends Adapter {
             ieeeAddr: <string>ziGateObject.payload.extendedAddress,
         };
         this.emit("deviceLeave", payload);
-    }
-
-    private waitressTimeoutFormatter(matcher: WaitressMatcher, timeout: number): string {
-        return (
-            `Timeout - ${matcher.address} - ${matcher.endpoint}` +
-            ` - ${matcher.transactionSequenceNumber} - ${matcher.clusterID}` +
-            ` - ${matcher.commandIdentifier} after ${timeout}ms`
-        );
-    }
-
-    private waitressValidator(payload: Events.ZclPayload, matcher: WaitressMatcher): boolean {
-        return Boolean(
-            payload.header &&
-                (!matcher.address || payload.address === matcher.address) &&
-                matcher.endpoint === payload.endpoint &&
-                (matcher.transactionSequenceNumber === undefined || payload.header.transactionSequenceNumber === matcher.transactionSequenceNumber) &&
-                matcher.clusterID === payload.clusterID &&
-                matcher.frameType === payload.header.frameControl.frameType &&
-                matcher.commandIdentifier === payload.header.commandIdentifier &&
-                matcher.direction === payload.header.frameControl.direction,
-        );
-    }
-
-    private onZiGateClose(): void {
-        if (!this.closing) {
-            this.emit("disconnected");
-        }
     }
 }

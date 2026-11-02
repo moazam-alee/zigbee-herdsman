@@ -2,7 +2,7 @@ import assert from "node:assert";
 import {logger} from "../../utils/logger";
 import * as Zcl from "../../zspec/zcl";
 import type {TFoundation} from "../../zspec/zcl/definition/clusters-types";
-import type {CustomClusters} from "../../zspec/zcl/definition/tstype";
+import type {Cluster, CustomClusters} from "../../zspec/zcl/definition/tstype";
 import zclTransactionSequenceNumber from "../helpers/zclTransactionSequenceNumber";
 import type {
     ClusterOrRawAttributeKeys,
@@ -144,10 +144,9 @@ export class Group extends ZigbeeEntity {
     }
 
     public static create(groupID: number): Group {
-        assert(typeof groupID === "number", "GroupID must be a number");
-        // Don't allow groupID 0, from the spec:
-        // "Scene identifier 0x00, along with group identifier 0x0000, is reserved for the global scene used by the OnOff cluster"
-        assert(groupID >= 1, "GroupID must be at least 1");
+        assert(Number.isInteger(groupID), "GroupID must be a whole number");
+        // Valid range from spec:
+        assert(groupID >= 0x0001 && groupID <= 0xfff7, "GroupID must be >= 1 and <= 65527");
 
         Group.loadFromDatabaseIfNecessary();
 
@@ -164,7 +163,7 @@ export class Group extends ZigbeeEntity {
     }
 
     public async removeFromNetwork(): Promise<void> {
-        for (const endpoint of this._members) {
+        for (const endpoint of [...this._members]) {
             await endpoint.removeFromGroup(this);
         }
 
@@ -268,10 +267,12 @@ export class Group extends ZigbeeEntity {
         const payload: TFoundation["write"] = [];
 
         for (const nameOrID in attributes) {
-            const attribute = cluster.getAttribute(nameOrID);
+            const attribute = Zcl.Utils.getClusterAttribute(cluster, nameOrID, options?.manufacturerCode);
 
             if (attribute) {
-                payload.push({attrId: attribute.ID, attrData: attributes[nameOrID], dataType: attribute.type});
+                const attrData = Zcl.Utils.processAttributeWrite(attribute, attributes[nameOrID]);
+
+                payload.push({attrId: attribute.ID, attrData, dataType: attribute.type});
             } else if (!Number.isNaN(Number(nameOrID))) {
                 const value = attributes[nameOrID];
 
@@ -320,13 +321,16 @@ export class Group extends ZigbeeEntity {
         const optionsWithDefaults = this.getOptionsWithDefaults(options, Zcl.Direction.CLIENT_TO_SERVER, cluster.manufacturerCode);
         const payload: TFoundation["read"] = [];
 
+        // TODO: handle `attr.required !== true` => should not throw
+
         for (const attribute of attributes) {
             if (typeof attribute === "number") {
                 payload.push({attrId: attribute});
             } else {
-                const attr = cluster.getAttribute(attribute);
+                const attr = Zcl.Utils.getClusterAttribute(cluster, attribute, options?.manufacturerCode);
 
                 if (attr) {
+                    Zcl.Utils.processAttributePreRead(attr);
                     payload.push({attrId: attr.ID});
                 } else {
                     logger.warning(`Ignoring unknown attribute ${attribute} in cluster ${cluster.name}`, NS);
@@ -363,19 +367,23 @@ export class Group extends ZigbeeEntity {
         }
     }
 
+    /**
+     * Send a cluster-specific command to the group.
+     * Pass a Cluster object to use a custom cluster that not every member has registered; supply explicit type arguments for payload checking.
+     */
     public async command<Cl extends number | string, Co extends number | string, Custom extends TCustomCluster | undefined = undefined>(
-        clusterKey: Cl,
+        clusterKey: Cl | Cluster,
         commandKey: Co,
         payload: ClusterOrRawPayload<Cl, Co, Custom>,
         options?: Options,
     ): Promise<undefined> {
         const customClusters = this.#customClusters[options?.direction === Zcl.Direction.SERVER_TO_CLIENT ? 1 : 0 /* default to CLIENT_TO_SERVER */];
-        const cluster = Zcl.Utils.getCluster(clusterKey, options?.manufacturerCode, customClusters);
+        const cluster = typeof clusterKey === "object" ? clusterKey : Zcl.Utils.getCluster(clusterKey, options?.manufacturerCode, customClusters);
         const optionsWithDefaults = this.getOptionsWithDefaults(options, Zcl.Direction.CLIENT_TO_SERVER, cluster.manufacturerCode);
         const command =
             optionsWithDefaults.direction === Zcl.Direction.CLIENT_TO_SERVER
-                ? cluster.getCommand(commandKey)
-                : cluster.getCommandResponse(commandKey);
+                ? Zcl.Utils.getClusterCommand(cluster, commandKey)
+                : Zcl.Utils.getClusterCommandResponse(cluster, commandKey);
 
         const createLogMessage = (): string => `Command ${this.groupID} ${cluster.name}.${command.name}(${JSON.stringify(payload)})`;
         logger.debug(createLogMessage, NS);

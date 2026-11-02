@@ -107,6 +107,8 @@ interface GreenPowerEventMap {
     deviceLeave: [sourceID: number];
 }
 
+const COMMISSIONING_NOTIFICATION_COMMAND_ID = Zcl.Clusters.greenPower.commands.commissioningNotification.ID;
+
 export class GreenPower extends EventEmitter<GreenPowerEventMap> {
     private adapter: Adapter;
 
@@ -217,7 +219,7 @@ export class GreenPower extends EventEmitter<GreenPowerEventMap> {
             undefined,
             zclTransactionSequenceNumber.next(),
             "pairing",
-            Zcl.Clusters.greenPower.ID,
+            "greenPower",
             payload,
             {},
         );
@@ -246,7 +248,7 @@ export class GreenPower extends EventEmitter<GreenPowerEventMap> {
         try {
             // notification: A.3.3.4.1
             // commissioningNotification: A.3.3.4.3
-            const isCommissioningNotification = frame.header.commandIdentifier === Zcl.Clusters.greenPower.commands.commissioningNotification.ID;
+            const isCommissioningNotification = frame.header.commandIdentifier === COMMISSIONING_NOTIFICATION_COMMAND_ID;
             const securityLevel = isCommissioningNotification ? (frame.payload.options >> 4) & 0x3 : (frame.payload.options >> 6) & 0x3;
 
             if (
@@ -378,7 +380,7 @@ export class GreenPower extends EventEmitter<GreenPowerEventMap> {
                             undefined,
                             zclTransactionSequenceNumber.next(),
                             "response",
-                            Zcl.Clusters.greenPower.ID,
+                            "greenPower",
                             payloadResponse,
                             {},
                         );
@@ -520,7 +522,7 @@ export class GreenPower extends EventEmitter<GreenPowerEventMap> {
                         undefined,
                         zclTransactionSequenceNumber.next(),
                         "response",
-                        Zcl.Clusters.greenPower.ID,
+                        "greenPower",
                         payload,
                         {},
                     );
@@ -533,10 +535,15 @@ export class GreenPower extends EventEmitter<GreenPowerEventMap> {
                     logger.debug(`[APP_DESCRIPTION] ${logStr}`, NS);
                     break;
                 }
-                case 0xa1: {
-                    // GP Manufacturer-specific Attribute Reporting
-                    break;
-                }
+                case 0xa0: // Attribute Reporting
+                case 0xa1: // Manufacturer-Specific Attribute Reporting
+                case 0xa2: // Multi-Cluster Reporting
+                case 0xa3: // Manufacturer-specific Multi-Cluster Reporting
+                case 0xa4: // Request Attributes => TODO: handle response
+                case 0xa5: // Read Attributes Response
+                    {
+                        break;
+                    }
                 /* v8 ignore stop */
                 default: {
                     // NOTE: this is spammy because it logs everything that is handed back to Controller without special processing here
@@ -592,7 +599,7 @@ export class GreenPower extends EventEmitter<GreenPowerEventMap> {
             undefined,
             zclTransactionSequenceNumber.next(),
             "commisioningMode",
-            Zcl.Clusters.greenPower.ID,
+            "greenPower",
             payload,
             {},
         );

@@ -145,7 +145,7 @@ describe("Requests", () => {
             sendZdoResponse = Zdo.Buffalo.readResponse(true, Zdo.ClusterId.LQI_TABLE_RESPONSE, LQI_TABLE_RESPONSE);
             const resp = await device.lqi();
 
-            if (resp.neighbors[0].ieeeAddr !== IEEE_ADDRESS1 || resp.neighbors[1].ieeeAddr !== IEEE_ADDRESS2) {
+            if (resp[0].eui64 !== IEEE_ADDRESS1 || resp[1].eui64 !== IEEE_ADDRESS2) {
                 throw new Error("Invalid response");
             }
         },
@@ -158,7 +158,7 @@ describe("Requests", () => {
             sendZclFrameToEndpointResponse = undefined;
             sendZdoResponse = undefined;
 
-            await endpoint.write("genBasic", {modelId: "Herd-02", manufacturerName: "HerdsmanNew"}, {sendPolicy: "immediate"});
+            await endpoint.write("genBasic", {physicalEnv: 2, deviceEnabled: 1}, {sendPolicy: "immediate"});
         },
         BENCH_OPTIONS,
     );
@@ -228,7 +228,7 @@ describe("Requests", () => {
             sendZclFrameToEndpointResponse = undefined;
             sendZdoResponse = undefined;
 
-            await group.write("genBasic", {modelId: "Herd-02", manufacturerName: "HerdsmanNew"});
+            await group.write("genBasic", {physicalEnv: 2, deviceEnabled: 1});
         },
         BENCH_OPTIONS,
     );
@@ -275,6 +275,7 @@ describe("Requests", () => {
                 },
                 BASIC_REQ_FRAME,
                 endpoint,
+                Zcl.Status.SUCCESS,
             );
         },
         {
@@ -307,6 +308,7 @@ describe("Requests", () => {
                 },
                 TIME_REQ_FRAME,
                 endpoint,
+                Zcl.Status.SUCCESS,
             );
         },
         {

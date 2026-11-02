@@ -172,6 +172,8 @@ type StackConfig = {
     TRANSIENT_KEY_TIMEOUT_S: number;
     /**@see Ezsp.ezspSetRadioIeee802154CcaMode */
     CCA_MODE?: keyof typeof IEEE802154CcaMode;
+    /** Default manufacturer code reported by coordinator. */
+    DEFAULT_MANUFACTURER_CODE: number;
 };
 
 /**
@@ -194,6 +196,7 @@ export const DEFAULT_STACK_CONFIG: Readonly<StackConfig> = {
     END_DEVICE_POLL_TIMEOUT: 8, // zigpc: 8
     TRANSIENT_KEY_TIMEOUT_S: 300, // zigpc: 65535
     CCA_MODE: undefined, // not set by default
+    DEFAULT_MANUFACTURER_CODE: Zcl.ManufacturerCode.SILICON_LABORATORIES,
 };
 /** Default behavior is to disable app key requests */
 const ALLOW_APP_KEY_REQUESTS = false;
@@ -215,8 +218,6 @@ const DEFAULT_REQUEST_TIMEOUT = 15000; // msec
 const DEFAULT_NETWORK_REQUEST_TIMEOUT = 10000; // nothing on the network to bother requests, should be much faster than this
 /** Time between watchdog counters reading/clearing */
 const WATCHDOG_COUNTERS_FEED_INTERVAL = 3600000; // every hour...
-/** Default manufacturer code reported by coordinator. */
-const DEFAULT_MANUFACTURER_CODE = Zcl.ManufacturerCode.SILICON_LABORATORIES;
 
 /**
  * Relay calls between Z2M and EZSP-layer and handle any error that might occur via queue & waitress.
@@ -250,11 +251,11 @@ export class EmberAdapter extends Adapter {
 
     constructor(
         networkOptions: TsType.NetworkOptions,
-        serialPortOptions: TsType.SerialPortOptions,
+        transportOptions: TsType.TransportOptions,
         backupPath: string,
         adapterOptions: TsType.AdapterOptions,
     ) {
-        super(networkOptions, serialPortOptions, backupPath, adapterOptions);
+        super(networkOptions, transportOptions, backupPath, adapterOptions);
         this.hasZdoMessageOverhead = true;
         this.manufacturerID = Zcl.ManufacturerCode.SILICON_LABORATORIES;
 
@@ -271,14 +272,14 @@ export class EmberAdapter extends Adapter {
         this.zdoRequestSequence = 0; // start at 1
         this.interpanLock = false;
         this.networkCache = initNetworkCache();
-        this.manufacturerCode = DEFAULT_MANUFACTURER_CODE; // will be set in NCP in initEzsp
+        this.manufacturerCode = DEFAULT_STACK_CONFIG.DEFAULT_MANUFACTURER_CODE; // will be overridden in initEzsp
         this.multicastTable = [];
 
         this.stackConfig = this.loadStackConfig();
         this.queue = new Queue(this.adapterOptions.concurrent || 16); // ORed to avoid 0 (not checked in settings/queue constructor)
         this.oneWaitress = new EmberOneWaitress();
 
-        this.ezsp = new Ezsp(serialPortOptions);
+        this.ezsp = new Ezsp(this.transport);
 
         this.ezsp.on("zdoResponse", this.onZDOResponse.bind(this));
         this.ezsp.on("incomingMessage", this.onIncomingMessage.bind(this));
@@ -350,6 +351,11 @@ export class EmberAdapter extends Adapter {
                 logger.error("[STACK CONFIG] Invalid TRANSIENT_KEY_TIMEOUT_S, using default.", NS);
             }
 
+            if (!inRange(config.DEFAULT_MANUFACTURER_CODE, 0, 65535)) {
+                config.DEFAULT_MANUFACTURER_CODE = DEFAULT_STACK_CONFIG.DEFAULT_MANUFACTURER_CODE;
+                logger.error("[STACK CONFIG] Invalid DEFAULT_MANUFACTURER_CODE, using default.", NS);
+            }
+
             config.CCA_MODE = config.CCA_MODE ?? undefined; // always default to undefined
 
             if (config.CCA_MODE && IEEE802154CcaMode[config.CCA_MODE] === undefined) {
@@ -395,12 +401,12 @@ export class EmberAdapter extends Adapter {
                 this.oneWaitress.resolveEvent(OneWaitressEvents.STACK_STATUS_NETWORK_CLOSED);
                 logger.info("[STACK STATUS] Network closed.", NS);
 
-                if (this.manufacturerCode !== DEFAULT_MANUFACTURER_CODE) {
+                if (this.manufacturerCode !== this.stackConfig.DEFAULT_MANUFACTURER_CODE) {
                     await this.queue.execute<void>(async () => {
                         logger.debug("[WORKAROUND] Reverting coordinator manufacturer code to default.", NS);
-                        await this.ezsp.ezspSetManufacturerCode(DEFAULT_MANUFACTURER_CODE);
+                        await this.ezsp.ezspSetManufacturerCode(this.stackConfig.DEFAULT_MANUFACTURER_CODE);
 
-                        this.manufacturerCode = DEFAULT_MANUFACTURER_CODE;
+                        this.manufacturerCode = this.stackConfig.DEFAULT_MANUFACTURER_CODE;
                     });
                 }
 
@@ -513,19 +519,23 @@ export class EmberAdapter extends Adapter {
      * @param messageContents The content of the response.
      */
     private onZDOResponse(apsFrame: EmberApsFrame, sender: NodeId, messageContents: Buffer): void {
-        const result = Zdo.Buffalo.readResponse(this.hasZdoMessageOverhead, apsFrame.clusterId, messageContents);
+        try {
+            const result = Zdo.Buffalo.readResponse(this.hasZdoMessageOverhead, apsFrame.clusterId, messageContents);
 
-        if (apsFrame.clusterId === Zdo.ClusterId.NETWORK_ADDRESS_RESPONSE) {
-            // special case to properly resolve a NETWORK_ADDRESS_RESPONSE following a NETWORK_ADDRESS_REQUEST (based on EUI64 from ZDO payload)
-            // NOTE: if response has invalid status (no EUI64 available), response waiter will eventually time out
-            if (Zdo.Buffalo.checkStatus<Zdo.ClusterId.NETWORK_ADDRESS_RESPONSE>(result)) {
-                this.oneWaitress.resolveZDO(result[1].eui64, apsFrame, result);
+            if (apsFrame.clusterId === Zdo.ClusterId.NETWORK_ADDRESS_RESPONSE) {
+                // special case to properly resolve a NETWORK_ADDRESS_RESPONSE following a NETWORK_ADDRESS_REQUEST (based on EUI64 from ZDO payload)
+                // NOTE: if response has invalid status (no EUI64 available), response waiter will eventually time out
+                if (Zdo.Buffalo.checkStatus<Zdo.ClusterId.NETWORK_ADDRESS_RESPONSE>(result)) {
+                    this.oneWaitress.resolveZDO(result[1].eui64, apsFrame, result);
+                }
+            } else {
+                this.oneWaitress.resolveZDO(sender, apsFrame, result);
             }
-        } else {
-            this.oneWaitress.resolveZDO(sender, apsFrame, result);
-        }
 
-        this.emit("zdoResponse", apsFrame.clusterId, result);
+            this.emit("zdoResponse", apsFrame.clusterId, result);
+        } catch (error) {
+            logger.error(`Unable to parse ZDO response: ${error}`, NS);
+        }
     }
 
     /**
@@ -619,7 +629,8 @@ export class EmberAdapter extends Adapter {
                 };
 
                 // set workaround manuf code if necessary, or revert to default if previous joined device required workaround and new one does not
-                const joinManufCode = WORKAROUND_JOIN_MANUF_IEEE_PREFIX_TO_CODE[newNodeEui64.substring(0, 8)] ?? DEFAULT_MANUFACTURER_CODE;
+                const joinManufCode =
+                    WORKAROUND_JOIN_MANUF_IEEE_PREFIX_TO_CODE[newNodeEui64.substring(0, 8)] ?? this.stackConfig.DEFAULT_MANUFACTURER_CODE;
 
                 if (this.manufacturerCode !== joinManufCode) {
                     await this.queue.execute<void>(async () => {
@@ -684,7 +695,10 @@ export class EmberAdapter extends Adapter {
         // return message tag only in ezspMessageSentHandler()
         await this.emberSetEzspPolicy(EzspPolicyId.MESSAGE_CONTENTS_IN_CALLBACK_POLICY, EzspDecisionId.MESSAGE_TAG_ONLY_IN_CALLBACK);
         await this.emberSetEzspValue(EzspValueId.TRANSIENT_DEVICE_TIMEOUT, 2, lowHighBytes(this.stackConfig.TRANSIENT_DEVICE_TIMEOUT));
-        await this.ezsp.ezspSetManufacturerCode(this.manufacturerCode);
+        await this.ezsp.ezspSetManufacturerCode(this.stackConfig.DEFAULT_MANUFACTURER_CODE);
+
+        this.manufacturerCode = this.stackConfig.DEFAULT_MANUFACTURER_CODE;
+
         // network security init
         await this.emberSetEzspConfigValue(EzspConfigId.STACK_PROFILE, STACK_PROFILE_ZIGBEE_PRO);
         await this.emberSetEzspConfigValue(EzspConfigId.SECURITY_LEVEL, SECURITY_LEVEL_Z3);
@@ -957,16 +971,22 @@ export class EmberAdapter extends Adapter {
                 logger.info("[INIT TC] Forming from backup.", NS);
                 // `backup` valid in this `action` path (not detected by TS)
                 /* v8 ignore start */
+                const keyList: LinkKeyBackupData[] = [];
+
                 // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-                const keyList: LinkKeyBackupData[] = backup!.devices.map((device) => ({
-                    deviceEui64: ZSpec.Utils.eui64BEBufferToHex(device.ieeeAddress),
-                    // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-                    key: {contents: device.linkKey!.key},
-                    // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-                    outgoingFrameCounter: device.linkKey!.txCounter,
-                    // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-                    incomingFrameCounter: device.linkKey!.rxCounter,
-                }));
+                for (const device of backup!.devices) {
+                    // link_key is optional in the open coordinator backup format, skip devices without one
+                    if (device.linkKey == null) {
+                        continue;
+                    }
+
+                    keyList.push({
+                        deviceEui64: ZSpec.Utils.eui64BEBufferToHex(device.ieeeAddress),
+                        key: {contents: device.linkKey.key},
+                        outgoingFrameCounter: device.linkKey.txCounter,
+                        incomingFrameCounter: device.linkKey.rxCounter,
+                    });
+                }
                 /* v8 ignore stop */
 
                 // before forming
@@ -1288,8 +1308,7 @@ export class EmberAdapter extends Adapter {
      * Received when EZSP layer alerts of a problem that needs the NCP to be reset.
      * @param status
      */
-    private onNcpNeedsResetAndInit(status: EzspStatus): void {
-        logger.error(`Adapter fatal error: ${EzspStatus[status]}`, NS);
+    private onNcpNeedsResetAndInit(_status: EzspStatus): void {
         this.emit("disconnected");
     }
 
@@ -1706,13 +1725,14 @@ export class EmberAdapter extends Adapter {
 
     /** WARNING: Adapter impl. Starts timer immediately upon returning */
     public waitFor(
-        networkAddress: number | undefined,
+        networkAddress: number,
         endpoint: number,
         _frameType: Zcl.FrameType,
         _direction: Zcl.Direction,
         transactionSequenceNumber: number | undefined,
         clusterID: number,
         commandIdentifier: number,
+        defaultRspCommandId: number | undefined,
         timeout: number,
     ): {promise: Promise<ZclPayload>; cancel: () => void} {
         const sourceEndpointInfo = FIXED_ENDPOINTS[0];
@@ -1730,6 +1750,7 @@ export class EmberAdapter extends Adapter {
                 },
                 zclSequence: transactionSequenceNumber,
                 commandIdentifier,
+                defaultRspCommandId,
             },
             timeout,
         );
@@ -1959,6 +1980,11 @@ export class EmberAdapter extends Adapter {
             apsFrame.options &= ~EmberApsOption.RETRY;
         }
 
+        // Zigbee Direct cluster, enable APS layer encryption
+        if (zclFrame.cluster.ID === Zcl.Clusters.zigbeeDirectConfiguration.ID) {
+            apsFrame.options |= EmberApsOption.ENCRYPTION;
+        }
+
         const data = zclFrame.toBuffer();
 
         return await this.queue.execute<ZclPayload | undefined>(async () => {
@@ -2171,10 +2197,12 @@ export class EmberAdapter extends Adapter {
     }
 
     // queued
-    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number): Promise<ZclPayload> {
+    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number, disableResponse: false): Promise<ZclPayload>;
+    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number, disableResponse: true): Promise<undefined>;
+    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number, disableResponse: boolean): Promise<ZclPayload | undefined> {
         const command = zclFrame.command;
 
-        if (command.response === undefined) {
+        if (!disableResponse && command.response === undefined) {
             throw new Error(`Command '${command.name}' has no response, cannot wait for response.`);
         }
 
@@ -2190,7 +2218,7 @@ export class EmberAdapter extends Adapter {
             sequence: 0, // set by stack
         };
 
-        return await this.queue.execute<ZclPayload>(async () => {
+        return await this.queue.execute<ZclPayload | undefined>(async () => {
             const msgBuffalo = new EzspBuffalo(Buffer.alloc(MAXIMUM_INTERPAN_LENGTH));
 
             // cache-enabled getters
@@ -2219,17 +2247,19 @@ export class EmberAdapter extends Adapter {
 
             // NOTE: can use ezspRawTransmitCompleteHandler if needed here
 
-            const result = await this.oneWaitress.startWaitingFor<ZclPayload>(
-                {
-                    target: undefined,
-                    apsFrame: apsFrame,
-                    zclSequence: zclFrame.header.transactionSequenceNumber,
-                    commandIdentifier: command.response,
-                },
-                timeout,
-            );
+            if (!disableResponse && command.response !== undefined) {
+                const result = await this.oneWaitress.startWaitingFor<ZclPayload>(
+                    {
+                        target: undefined,
+                        apsFrame: apsFrame,
+                        zclSequence: zclFrame.header.transactionSequenceNumber,
+                        commandIdentifier: command.response,
+                    },
+                    timeout,
+                );
 
-            return result;
+                return result;
+            }
         });
     }
 

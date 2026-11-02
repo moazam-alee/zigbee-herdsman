@@ -1,24 +1,14 @@
-/* v8 ignore start */
 /**
- * How to run:
- * ```bash
- * npm i -g ts-node
- * ts-node ./src/zspec/zcl/definition/clusters-typegen.ts && pnpm run check:w
- * ```
- * or with compiled:
- * ```bash
- * pnpm run prepack
- * node ./dist/zspec/zcl/definition/clusters-typegen.js && pnpm run check:w
- * ```
+ * Usage:
+ *   tsx scripts/clusters-typegen.ts && pnpm run check:w
  */
 import {writeFileSync} from "node:fs";
 import ts from "typescript";
-import {isFoundationDiscoverRsp} from "../utils";
-import {Clusters} from "./cluster";
-import {BuffaloZclDataType, DataType} from "./enums";
-import {Foundation, type FoundationCommandName, type FoundationDefinition} from "./foundation";
-import {ManufacturerCode} from "./manufacturerCode";
-import type {AttributeDefinition, ClusterName, CommandDefinition, ParameterDefinition} from "./tstype";
+import {Clusters} from "../src/zspec/zcl/definition/cluster";
+import {BuffaloZclDataType, DataType} from "../src/zspec/zcl/definition/enums";
+import {Foundation, type FoundationCommandName} from "../src/zspec/zcl/definition/foundation";
+import {ManufacturerCode} from "../src/zspec/zcl/definition/manufacturerCode";
+import type {Attribute, ClusterName, Command, Parameter} from "../src/zspec/zcl/definition/tstype";
 
 const FILENAME = "clusters-types.ts";
 
@@ -30,23 +20,34 @@ const emptyObject = ts.factory.createTypeReferenceNode("Record", [
     ts.factory.createKeywordTypeNode(ts.SyntaxKind.NeverKeyword),
 ]);
 
+const foundationImport = ts.factory.createImportDeclaration(
+    undefined,
+    ts.factory.createImportClause(
+        ts.SyntaxKind.TypeKeyword,
+        undefined,
+        ts.factory.createNamedImports([ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier("Foundation"))]),
+    ),
+    ts.factory.createStringLiteral("./foundation"),
+    undefined,
+);
 const namedImports = ts.factory.createImportDeclaration(
     undefined,
     ts.factory.createImportClause(
-        true,
+        ts.SyntaxKind.TypeKeyword,
         undefined,
         ts.factory.createNamedImports([
             // sorted by name
             ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier("ExtensionFieldSet")),
             ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier("Gpd")),
-            ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier("GpdAttributeReport")),
+            ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier("GpdAttributeReporting")),
             ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier("GpdChannelConfiguration")),
             ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier("GpdChannelRequest")),
             ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier("GpdCommissioningReply")),
             ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier("GpdCustomReply")),
-            ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier("MiboxerZone")),
+            ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier("GpdReadAttributeResponse")),
+            ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier("GpdRequestAttribute")),
             ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier("Struct")),
-            ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier("StructuredSelector")),
+            // ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier("StructuredSelector")), // XXX: currently unused
             ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier("ThermoTransition")),
             ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier("TuyaDataPointValue")),
             ts.factory.createImportSpecifier(false, undefined, ts.factory.createIdentifier("ZclArray")),
@@ -128,14 +129,16 @@ const getTypeFromDataType = (dataType: DataType | BuffaloZclDataType): ts.TypeNo
             return ts.factory.createUnionTypeNode([
                 ts.factory.createTypeReferenceNode("Gpd"),
                 ts.factory.createTypeReferenceNode("GpdChannelRequest"),
-                ts.factory.createTypeReferenceNode("GpdAttributeReport"),
+                ts.factory.createTypeReferenceNode("GpdAttributeReporting"),
+                ts.factory.createTypeReferenceNode("GpdCommissioningReply"),
+                ts.factory.createTypeReferenceNode("GpdChannelConfiguration"),
+                ts.factory.createTypeReferenceNode("GpdCustomReply"),
+                ts.factory.createTypeReferenceNode("GpdReadAttributeResponse"),
+                ts.factory.createTypeReferenceNode("GpdRequestAttribute"),
                 ts.factory.createTypeLiteralNode([
                     ts.factory.createPropertySignature(undefined, "raw", undefined, ts.factory.createTypeReferenceNode("Buffer")),
                 ]),
                 ts.factory.createTypeReferenceNode("Record<string, never>"),
-                ts.factory.createTypeReferenceNode("GpdCommissioningReply"),
-                ts.factory.createTypeReferenceNode("GpdChannelConfiguration"),
-                ts.factory.createTypeReferenceNode("GpdCustomReply"),
             ]);
         }
         case BuffaloZclDataType.STRUCTURED_SELECTOR: {
@@ -153,9 +156,23 @@ const getTypeFromDataType = (dataType: DataType | BuffaloZclDataType): ts.TypeNo
     }
 };
 
-const getConditionStr = (conditions: ParameterDefinition["conditions"]): string | undefined => {
+const getPropertyStr = (key: string, val: unknown, padId = 4) => {
+    let valStr = `${val}`;
+
+    if (key === "ID") {
+        valStr = `0x${Number(val).toString(16).padStart(padId, "0")}`;
+    } else if (key === "type") {
+        valStr = `${DataType[val as number] ?? BuffaloZclDataType[val as number]}`;
+    } else if (key === "manufacturerCode") {
+        valStr = `${ManufacturerCode[val as number]}(0x${Number(val).toString(16).padStart(4, "0")})`;
+    }
+
+    return valStr;
+};
+
+const getConditionStr = (conditions: Parameter["conditions"]): string | undefined => {
     if (conditions) {
-        let str = ", Conditions: [";
+        let str = "conditions=[";
 
         for (const condition of conditions) {
             str += `{${condition.type}`;
@@ -175,7 +192,7 @@ const getConditionStr = (conditions: ParameterDefinition["conditions"]): string 
     }
 };
 
-const addAttributes = (attributes: Readonly<Record<string, Readonly<AttributeDefinition>>>): ts.TypeNode => {
+const addAttributes = (attributes: Readonly<Record<string, Readonly<Attribute>>>): ts.TypeNode => {
     const elements: ts.PropertySignature[] = [];
 
     for (const attributeName in attributes) {
@@ -191,11 +208,17 @@ const addAttributes = (attributes: Readonly<Record<string, Readonly<AttributeDef
 
         elements.push(element);
 
-        let comment = `* ID: ${attribute.ID} | Type: ${DataType[attribute.type] ?? BuffaloZclDataType[attribute.type]} `;
+        const commentChunks: string[] = [];
 
-        if (attribute.manufacturerCode !== undefined) {
-            comment += `| Specific to manufacturer: ${ManufacturerCode[attribute.manufacturerCode]} (${attribute.manufacturerCode}) `;
+        for (const key in attribute) {
+            if (key === "name") {
+                continue;
+            }
+
+            commentChunks.push(`${key}=${getPropertyStr(key, attribute[key as keyof typeof attribute], 4)}`);
         }
+
+        const comment = `* ${commentChunks.join(" | ")} `;
 
         ts.addSyntheticLeadingComment(element, ts.SyntaxKind.MultiLineCommentTrivia, comment, true);
     }
@@ -203,7 +226,7 @@ const addAttributes = (attributes: Readonly<Record<string, Readonly<AttributeDef
     return elements.length > 0 ? ts.factory.createTypeLiteralNode(elements) : ts.factory.createKeywordTypeNode(ts.SyntaxKind.NeverKeyword);
 };
 
-const addCommands = (commands: Readonly<Record<string, Readonly<CommandDefinition>>>): ts.TypeNode => {
+const addCommands = (commands: Readonly<Record<string, Readonly<Command>>>): ts.TypeNode => {
     const elements: ts.PropertySignature[] = [];
 
     for (const commandName in commands) {
@@ -222,15 +245,22 @@ const addCommands = (commands: Readonly<Record<string, Readonly<CommandDefinitio
                     parameter.conditions ? ts.factory.createToken(ts.SyntaxKind.QuestionToken) : undefined,
                     paramType,
                 );
+
                 const conditionComment = getConditionStr(parameter.conditions);
+                const commentChunks: string[] = [];
+
+                for (const key in parameter) {
+                    if (key === "name" || key === "conditions") {
+                        continue;
+                    }
+
+                    commentChunks.push(`${key}=${getPropertyStr(key, parameter[key as keyof typeof parameter])}`);
+                }
+
+                const comment = `* ${commentChunks.join(" | ")}${conditionComment ? ` | ${conditionComment}` : ""} `;
 
                 cmdElements.push(cmdElement);
-                ts.addSyntheticLeadingComment(
-                    cmdElement,
-                    ts.SyntaxKind.MultiLineCommentTrivia,
-                    `* Type: ${DataType[parameter.type] ?? BuffaloZclDataType[parameter.type]}${conditionComment ?? ""} `,
-                    true,
-                );
+                ts.addSyntheticLeadingComment(cmdElement, ts.SyntaxKind.MultiLineCommentTrivia, comment, true);
             } else if (
                 // @ts-expect-error bad typing?
                 existing.type?.typeName?.escapedText &&
@@ -261,11 +291,17 @@ const addCommands = (commands: Readonly<Record<string, Readonly<CommandDefinitio
 
         elements.push(element);
 
-        let comment = `* ID: ${command.ID} `;
+        const commentChunks: string[] = [];
 
-        if (command.response !== undefined) {
-            comment += `| Response ID: ${command.response} `;
+        for (const key in command) {
+            if (key === "name" || key === "parameters") {
+                continue;
+            }
+
+            commentChunks.push(`${key}=${getPropertyStr(key, command[key as keyof typeof command], 2)}`);
         }
+
+        const comment = `* ${commentChunks.join(" | ")} `;
 
         ts.addSyntheticLeadingComment(element, ts.SyntaxKind.MultiLineCommentTrivia, comment, true);
     }
@@ -300,94 +336,25 @@ const clustersDecl = ts.factory.createInterfaceDeclaration(
     clusterElements,
 );
 
-const addParameters = (foundation: Readonly<FoundationDefinition>): ts.TypeNode => {
-    const elements: ts.PropertySignature[] = [];
-
-    for (const parameter of foundation.parameters) {
-        const element = ts.factory.createPropertySignature(
-            undefined,
-            parameter.name,
-            parameter.conditions ? ts.factory.createToken(ts.SyntaxKind.QuestionToken) : undefined,
-            getTypeFromDataType(parameter.type),
-        );
-        const conditionComment = getConditionStr(parameter.conditions);
-
-        elements.push(element);
-
-        ts.addSyntheticLeadingComment(
-            element,
-            ts.SyntaxKind.MultiLineCommentTrivia,
-            `* Type: ${DataType[parameter.type] ?? BuffaloZclDataType[parameter.type]}${conditionComment ?? ""} `,
-            true,
-        );
-    }
-
-    if (elements.length === 0) {
-        return emptyObject;
-    }
-
-    switch (foundation.parseStrategy) {
-        case "repetitive": {
-            return ts.factory.createArrayTypeNode(ts.factory.createTypeLiteralNode(elements));
-        }
-        case "flat": {
-            return ts.factory.createTypeLiteralNode(elements);
-        }
-        case "oneof": {
-            if (isFoundationDiscoverRsp(foundation.ID)) {
-                const discComplete = ts.factory.createPropertySignature(
-                    undefined,
-                    "discComplete",
-                    undefined,
-                    ts.factory.createKeywordTypeNode(ts.SyntaxKind.NumberKeyword),
-                );
-
-                ts.addSyntheticLeadingComment(discComplete, ts.SyntaxKind.MultiLineCommentTrivia, `* Type: ${DataType[DataType.UINT8]} `, true);
-
-                return ts.factory.createTypeLiteralNode([
-                    discComplete,
-                    ts.factory.createPropertySignature(
-                        undefined,
-                        "attrInfos",
-                        undefined,
-                        ts.factory.createArrayTypeNode(ts.factory.createTypeLiteralNode(elements)),
-                    ),
-                ]);
-            }
-        }
-    }
-
-    throw new Error(`Unknown command strategy for ${JSON.stringify(foundation)}`);
-};
-
 const foundationElements: ts.TypeElement[] = [];
-const foundationRepetitiveElements: ts.TypeNode[] = [];
-const foundationFlatElements: ts.TypeNode[] = [];
-const foundationOneOfElements: ts.TypeNode[] = [];
 
 for (const foundationName in Foundation) {
     const foundation = Foundation[foundationName as FoundationCommandName];
-    const element = ts.factory.createPropertySignature(undefined, foundationName, undefined, addParameters(foundation));
+    const typeQuery = ts.factory.createTypeQueryNode(
+        ts.factory.createQualifiedName(
+            ts.factory.createQualifiedName(ts.factory.createIdentifier("Foundation"), ts.factory.createIdentifier(foundationName)),
+            ts.factory.createIdentifier("parse"),
+        ),
+    );
+    const element = ts.factory.createPropertySignature(
+        undefined,
+        foundationName,
+        undefined,
+        ts.factory.createTypeReferenceNode("ReturnType", [typeQuery]),
+    );
 
     foundationElements.push(element);
     ts.addSyntheticLeadingComment(element, ts.SyntaxKind.MultiLineCommentTrivia, `* ID: ${foundation.ID} `, true);
-
-    const stratNode = ts.factory.createTypeReferenceNode(`"${foundationName}"`);
-
-    switch (foundation.parseStrategy) {
-        case "repetitive": {
-            foundationRepetitiveElements.push(stratNode);
-            break;
-        }
-        case "flat": {
-            foundationFlatElements.push(stratNode);
-            break;
-        }
-        case "oneof": {
-            foundationOneOfElements.push(stratNode);
-            break;
-        }
-    }
 }
 
 const foundationDecl = ts.factory.createInterfaceDeclaration(
@@ -398,24 +365,6 @@ const foundationDecl = ts.factory.createInterfaceDeclaration(
     foundationElements,
 );
 
-const foundationRepetitiveDecl = ts.factory.createTypeAliasDeclaration(
-    [ts.factory.createModifier(ts.SyntaxKind.ExportKeyword)],
-    "TFoundationRepetitive",
-    undefined,
-    ts.factory.createUnionTypeNode(foundationRepetitiveElements),
-);
-const foundationFlatDecl = ts.factory.createTypeAliasDeclaration(
-    [ts.factory.createModifier(ts.SyntaxKind.ExportKeyword)],
-    "TFoundationFlat",
-    undefined,
-    ts.factory.createUnionTypeNode(foundationFlatElements),
-);
-const foundationOneOfDecl = ts.factory.createTypeAliasDeclaration(
-    [ts.factory.createModifier(ts.SyntaxKind.ExportKeyword)],
-    "TFoundationOneOf",
-    undefined,
-    ts.factory.createUnionTypeNode(foundationOneOfElements),
-);
 const clDecl = ts.factory.createTypeParameterDeclaration(
     undefined,
     "Cl",
@@ -518,24 +467,6 @@ const foundationGenericPayloadDecl = ts.factory.createTypeAliasDeclaration(
     undefined,
     ts.factory.createTypeReferenceNode(`${foundationDecl.name.escapedText}[keyof ${foundationDecl.name.escapedText}]`),
 );
-const foundationRepetitivePayloadDecl = ts.factory.createTypeAliasDeclaration(
-    [ts.factory.createModifier(ts.SyntaxKind.ExportKeyword)],
-    "TFoundationRepetitivePayload",
-    undefined,
-    ts.factory.createTypeReferenceNode(`${foundationDecl.name.escapedText}[${foundationRepetitiveDecl.name.escapedText}]`),
-);
-const foundationFlatPayloadDecl = ts.factory.createTypeAliasDeclaration(
-    [ts.factory.createModifier(ts.SyntaxKind.ExportKeyword)],
-    "TFoundationFlatPayload",
-    undefined,
-    ts.factory.createTypeReferenceNode(`${foundationDecl.name.escapedText}[${foundationFlatDecl.name.escapedText}]`),
-);
-const foundationOneOfPayloadDecl = ts.factory.createTypeAliasDeclaration(
-    [ts.factory.createModifier(ts.SyntaxKind.ExportKeyword)],
-    "TFoundationOneOfPayload",
-    undefined,
-    ts.factory.createTypeReferenceNode(`${foundationDecl.name.escapedText}[${foundationOneOfDecl.name.escapedText}]`),
-);
 const foundationPayloadDecl = ts.factory.createTypeAliasDeclaration(
     [ts.factory.createModifier(ts.SyntaxKind.ExportKeyword)],
     "TFoundationPayload",
@@ -545,15 +476,12 @@ const foundationPayloadDecl = ts.factory.createTypeAliasDeclaration(
     ),
 );
 
-const result = `${printer.printNode(ts.EmitHint.Unspecified, namedImports, file)}
+const result = `${printer.printNode(ts.EmitHint.Unspecified, foundationImport, file)}
+${printer.printNode(ts.EmitHint.Unspecified, namedImports, file)}
 
 ${printer.printNode(ts.EmitHint.Unspecified, clustersDecl, file)}
 
 ${printer.printNode(ts.EmitHint.Unspecified, foundationDecl, file)}
-
-${printer.printNode(ts.EmitHint.Unspecified, foundationRepetitiveDecl, file)}
-${printer.printNode(ts.EmitHint.Unspecified, foundationFlatDecl, file)}
-${printer.printNode(ts.EmitHint.Unspecified, foundationOneOfDecl, file)}
 
 // Clusters
 ${printer.printNode(ts.EmitHint.Unspecified, clusterAttributeKeysDecl, file)}
@@ -578,9 +506,6 @@ ${printer.printNode(ts.EmitHint.Unspecified, clusterPayloadDecl, file)}
 
 // Foundation
 ${printer.printNode(ts.EmitHint.Unspecified, foundationGenericPayloadDecl, file)}
-${printer.printNode(ts.EmitHint.Unspecified, foundationRepetitivePayloadDecl, file)}
-${printer.printNode(ts.EmitHint.Unspecified, foundationFlatPayloadDecl, file)}
-${printer.printNode(ts.EmitHint.Unspecified, foundationOneOfPayloadDecl, file)}
 
 ${printer.printNode(ts.EmitHint.Unspecified, foundationPayloadDecl, file)}
 `;

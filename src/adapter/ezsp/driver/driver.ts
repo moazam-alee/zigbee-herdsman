@@ -11,6 +11,7 @@ import * as ZSpec from "../../../zspec";
 import {Clusters} from "../../../zspec/zcl/definition/cluster";
 import * as Zdo from "../../../zspec/zdo";
 import type {GenericZdoResponse} from "../../../zspec/zdo/definition/tstypes";
+import type {AdapterTransport} from "../../transport";
 import type * as TsType from "./../../tstype";
 import {EZSPAdapterBackup} from "../adapter/backup";
 import type {ParamsDesc} from "./commands";
@@ -115,14 +116,14 @@ export class Driver extends EventEmitter {
     private multicast: Multicast;
     private waitress: Waitress<EmberFrame, EmberWaitressMatcher>;
     private transactionID = 1;
-    private serialOpt: TsType.SerialPortOptions;
+    private readonly transport: AdapterTransport;
     public backupMan: EZSPAdapterBackup;
 
-    constructor(serialOpt: TsType.SerialPortOptions, nwkOpt: TsType.NetworkOptions, backupPath: string) {
+    constructor(transport: AdapterTransport, nwkOpt: TsType.NetworkOptions, backupPath: string) {
         super();
 
         this.nwkOpt = nwkOpt;
-        this.serialOpt = serialOpt;
+        this.transport = transport;
         this.waitress = new Waitress<EmberFrame, EmberWaitressMatcher>(this.waitressValidator, this.waitressTimeoutFormatter);
         this.backupMan = new EZSPAdapterBackup(this, backupPath);
     }
@@ -136,8 +137,7 @@ export class Driver extends EventEmitter {
         logger.debug("Reset connection.", NS);
 
         try {
-            // don't emit 'close' on stop since we don't want this to bubble back up as 'disconnected' to the controller.
-            await this.stop(false);
+            await this.stop();
         } catch (err) {
             logger.debug(`Stop error ${err}`, NS);
         }
@@ -149,7 +149,6 @@ export class Driver extends EventEmitter {
             logger.debug(`Reset error ${err}`, NS);
 
             try {
-                // here we let emit
                 await this.stop();
             } catch (stopErr) {
                 logger.debug(`Failed to stop after failed reset ${stopErr}`, NS);
@@ -162,16 +161,11 @@ export class Driver extends EventEmitter {
         await this.reset();
     }
 
-    private onEzspClose(): void {
-        logger.debug("onEzspClose()", NS);
-        this.emit("close");
-    }
-
-    public async stop(emitClose = true): Promise<void> {
+    public async stop(): Promise<void> {
         logger.debug("Stopping driver", NS);
 
         if (this.ezsp) {
-            return await this.ezsp.close(emitClose);
+            return await this.ezsp.close();
         }
     }
 
@@ -179,11 +173,10 @@ export class Driver extends EventEmitter {
         let result: TsType.StartResult = "resumed";
         this.transactionID = 1;
         // this.ezsp = undefined;
-        this.ezsp = new Ezsp();
-        this.ezsp.on("close", this.onEzspClose.bind(this));
+        this.ezsp = new Ezsp(this.transport);
 
         try {
-            await this.ezsp.connect(this.serialOpt);
+            await this.ezsp.connect();
         } catch (error) {
             logger.debug(`EZSP could not connect: ${error}`, NS);
 
@@ -296,9 +289,9 @@ export class Driver extends EventEmitter {
         this.ezsp.on("frame", this.handleFrame.bind(this));
         logger.debug(`EZSP nwk=${nwk}, IEEE=0x${this.ieee}`, NS);
         const linkResult = await this.getKey(EmberKeyType.TRUST_CENTER_LINK_KEY);
-        logger.debug(`TRUST_CENTER_LINK_KEY: ${JSON.stringify(linkResult)}`, NS);
+        logger.debug(() => `TRUST_CENTER_LINK_KEY: ${JSON.stringify(linkResult)}`, NS);
         const netResult = await this.getKey(EmberKeyType.CURRENT_NETWORK_KEY);
-        logger.debug(`CURRENT_NETWORK_KEY: ${JSON.stringify(netResult)}`, NS);
+        logger.debug(() => `CURRENT_NETWORK_KEY: ${JSON.stringify(netResult)}`, NS);
 
         await wait(1000);
         await this.ezsp.execCommand("setManufacturerCode", {code: DEFAULT_MFG_ID});
@@ -486,7 +479,7 @@ export class Driver extends EventEmitter {
                     if (msgType === EmberOutgoingMessageType.OUTGOING_MULTICAST) {
                         const apsFrame = frame.apsFrame;
                         if (apsFrame.destinationEndpoint === 255) {
-                            this.multicast.subscribe(apsFrame.groupId, 1);
+                            this.multicast.subscribe(apsFrame.groupId, 1).catch(() => {});
                         }
                     }
                 }
@@ -632,7 +625,7 @@ export class Driver extends EventEmitter {
             if (Buffer.from(ieee.value).indexOf(Buffer.from(rec.prefix)) === 0) {
                 // set ManufacturerCode
                 logger.debug(`handleNodeJoined: change ManufacturerCode for ieee ${ieee} to ${rec.mfgId}`, NS);
-                this.resetMfgId(rec.mfgId);
+                this.resetMfgId(rec.mfgId).catch(() => {});
                 break;
             }
         }

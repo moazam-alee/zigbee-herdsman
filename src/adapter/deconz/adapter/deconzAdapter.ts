@@ -12,9 +12,9 @@ import type {BroadcastAddress} from "../../../zspec/enums";
 import * as Zcl from "../../../zspec/zcl";
 import * as Zdo from "../../../zspec/zdo";
 import type * as ZdoTypes from "../../../zspec/zdo/definition/tstypes";
-import Adapter from "../../adapter";
+import Adapter, {type ClusterWaitressMatcher, type ZclWaitressPayload} from "../../adapter";
 import type * as Events from "../../events";
-import type {AdapterOptions, CoordinatorVersion, NetworkOptions, NetworkParameters, SerialPortOptions, StartResult} from "../../tstype";
+import type {AdapterOptions, CoordinatorVersion, NetworkOptions, NetworkParameters, StartResult, TransportOptions} from "../../tstype";
 import {readBackup} from "../../utils";
 import PARAM, {
     ApsAddressMode,
@@ -30,31 +30,21 @@ import processFrame, {frameParserEvents} from "../driver/frameParser";
 
 const NS = "zh:deconz";
 
-interface WaitressMatcher {
-    address?: number | string;
-    endpoint: number;
-    transactionSequenceNumber?: number;
-    frameType: Zcl.FrameType;
-    clusterID: number;
-    commandIdentifier: number;
-    direction: number;
-}
-
 export class DeconzAdapter extends Adapter {
     private driver: Driver;
     private openRequestsQueue: WaitForDataRequest[];
     private frameParserEvent = frameParserEvents;
     // biome-ignore lint/correctness/noUnusedPrivateClassMembers: ignore
     private fwVersion?: CoordinatorVersion;
-    private waitress: Waitress<Events.ZclPayload, WaitressMatcher>;
+    private waitress: Waitress<ZclWaitressPayload, ClusterWaitressMatcher>;
     private joinPermitted = false;
 
-    public constructor(networkOptions: NetworkOptions, serialPortOptions: SerialPortOptions, backupPath: string, adapterOptions: AdapterOptions) {
-        super(networkOptions, serialPortOptions, backupPath, adapterOptions);
+    public constructor(networkOptions: NetworkOptions, transportOptions: TransportOptions, backupPath: string, adapterOptions: AdapterOptions) {
+        super(networkOptions, transportOptions, backupPath, adapterOptions);
         this.hasZdoMessageOverhead = true;
         this.manufacturerID = Zcl.ManufacturerCode.DRESDEN_ELEKTRONIK_INGENIEURTECHNIK_GMBH;
 
-        this.waitress = new Waitress<Events.ZclPayload, WaitressMatcher>(this.waitressValidator, this.waitressTimeoutFormatter);
+        this.waitress = new Waitress(Adapter.zclWaitressValidator, Adapter.clusterWaitressTimeoutFormatter);
 
         const firmwareLog = [];
         if (backupPath) {
@@ -76,7 +66,7 @@ export class DeconzAdapter extends Adapter {
             }
         }
 
-        this.driver = new Driver(serialPortOptions, networkOptions, this.getStoredBackup(), firmwareLog);
+        this.driver = new Driver(this.transport, networkOptions, this.getStoredBackup(), firmwareLog);
 
         this.driver.on("rxFrame", (frame) => processFrame(frame));
         this.openRequestsQueue = [];
@@ -205,26 +195,19 @@ export class DeconzAdapter extends Adapter {
     }
 
     public waitFor(
-        networkAddress: number | undefined,
+        networkAddress: number,
         endpoint: number,
-        frameType: Zcl.FrameType,
-        direction: Zcl.Direction,
+        _frameType: Zcl.FrameType,
+        _direction: Zcl.Direction,
         transactionSequenceNumber: number | undefined,
-        clusterID: number,
-        commandIdentifier: number,
+        clusterId: number,
+        commandId: number,
+        defaultRspCommandId: number | undefined,
         timeout: number,
     ): {promise: Promise<Events.ZclPayload>; cancel: () => void} {
-        const payload = {
-            address: networkAddress,
-            endpoint,
-            clusterID,
-            commandIdentifier,
-            frameType,
-            direction,
-            transactionSequenceNumber,
-        };
+        const payload = {address: networkAddress, endpoint, clusterId, commandId, defaultRspCommandId, transactionSequenceNumber};
 
-        logger.debug(`waitFor() called ${JSON.stringify(payload)}`, NS);
+        logger.debug(() => `waitFor() called ${JSON.stringify(payload)}`, NS);
 
         const waiter = this.waitress.waitFor(payload, timeout);
         const cancel = (): void => this.waitress.remove(waiter.ID);
@@ -297,6 +280,7 @@ export class DeconzAdapter extends Adapter {
         try {
             await confirm;
 
+            // biome-ignore lint/nursery/noMisusedPromises: ignore
             if (indication) {
                 const indicationIndex = this.openRequestsQueue.findIndex(
                     (x) => x.clusterId === responseClusterId && x.transactionSequenceNumber === transactionID,
@@ -308,6 +292,7 @@ export class DeconzAdapter extends Adapter {
             }
         } catch (err) {
             // no need to wait for indication, remove waiter from queue
+            // biome-ignore lint/nursery/noMisusedPromises: ignore
             if (indication) {
                 const indicationIndex = this.openRequestsQueue.findIndex(
                     (x) => x.clusterId === responseClusterId && x.transactionSequenceNumber === transactionID,
@@ -321,6 +306,7 @@ export class DeconzAdapter extends Adapter {
             throw new Error(`failed to send ZDO request seq: (${transactionID}) ${err}`);
         }
 
+        // biome-ignore lint/nursery/noMisusedPromises: ignore
         if (indication) {
             try {
                 const data = await indication;
@@ -367,7 +353,12 @@ export class DeconzAdapter extends Adapter {
         // TODO(mpi): Enable APS ACKs for tricky devices, maintain a list of those, or keep at least a few slots free for non APS ACK requests.
         //const txOptions = 0x4; // 0x00 normal, 0x04 APS ACK
         // TODO(mpi): Disable APS ACKs for now until we find a better solution to not block queues.
-        const txOptions = 0;
+        let txOptions = 0x00;
+
+        // Zigbee Direct cluster, enable APS layer encryption
+        if (zclFrame.cluster.ID === Zcl.Clusters.zigbeeDirectConfiguration.ID) {
+            txOptions |= 0x01;
+        }
 
         const request: ApsDataRequest = {
             requestId: transactionID,
@@ -440,6 +431,7 @@ export class DeconzAdapter extends Adapter {
         try {
             await confirm;
 
+            // biome-ignore lint/nursery/noMisusedPromises: ignore
             if (indication) {
                 const indicationIndex = this.openRequestsQueue.findIndex(
                     (x) => x.clusterId === zclFrame.cluster.ID && x.transactionSequenceNumber === zclFrame.header.transactionSequenceNumber,
@@ -451,6 +443,7 @@ export class DeconzAdapter extends Adapter {
             }
         } catch (err) {
             // no need to wait for indication, remove waiter from queue
+            // biome-ignore lint/nursery/noMisusedPromises: ignore
             if (indication) {
                 const indicationIndex = this.openRequestsQueue.findIndex(
                     (x) => x.clusterId === zclFrame.cluster.ID && x.transactionSequenceNumber === zclFrame.header.transactionSequenceNumber,
@@ -464,6 +457,7 @@ export class DeconzAdapter extends Adapter {
             throw new Error(`failed to send ZCL request (${zclFrame.header.transactionSequenceNumber}) ${err}`);
         }
 
+        // biome-ignore lint/nursery/noMisusedPromises: ignore
         if (indication) {
             try {
                 const data = await indication;
@@ -639,7 +633,13 @@ export class DeconzAdapter extends Adapter {
     public async sendZclFrameInterPANToIeeeAddr(_zclFrame: Zcl.Frame, _ieeeAddr: string): Promise<void> {
         await Promise.reject(new Error("not supported"));
     }
-    public async sendZclFrameInterPANBroadcast(_zclFrame: Zcl.Frame, _timeout: number): Promise<Events.ZclPayload> {
+    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number, disableResponse: false): Promise<Events.ZclPayload>;
+    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number, disableResponse: true): Promise<undefined>;
+    public async sendZclFrameInterPANBroadcast(
+        _zclFrame: Zcl.Frame,
+        _timeout: number,
+        _disableResponse: boolean,
+    ): Promise<Events.ZclPayload | undefined> {
         return await Promise.reject(new Error("not supported"));
     }
     public async sendZclFrameInterPANBroadcastWithResponse(_zclFrame: Zcl.Frame, _timeout: number): Promise<Events.ZclPayload> {
@@ -663,7 +663,7 @@ export class DeconzAdapter extends Adapter {
         transactionSequenceNumber: number,
         timeout: number,
     ): Promise<ReceivedDataResponse> {
-        return new Promise((resolve, reject): void => {
+        const promise = new Promise<ReceivedDataResponse>((resolve, reject): void => {
             const ts = Date.now();
             if (!timeout) {
                 timeout = 60000;
@@ -673,6 +673,8 @@ export class DeconzAdapter extends Adapter {
             const req: WaitForDataRequest = {addr, profileId, clusterId, transactionSequenceNumber, resolve, reject, confirmed, ts, timeout};
             this.openRequestsQueue.push(req);
         });
+        promise.catch(() => {});
+        return promise;
     }
 
     private checkReceivedGreenPowerIndication(ind: GpDataInd): void {
@@ -701,25 +703,27 @@ export class DeconzAdapter extends Adapter {
             destinationEndpoint: ZSpec.GP_ENDPOINT,
         };
 
-        this.waitress.resolve(payload);
+        if (payload.header !== undefined) {
+            this.waitress.resolve(payload as ZclWaitressPayload);
+        }
+
         this.emit("zclPayload", payload);
     }
 
     private checkWaitForDataRequestTimeouts() {
-        if (this.openRequestsQueue.length === 0) {
-            return;
-        }
-
         const now = Date.now();
-        const req: WaitForDataRequest = this.openRequestsQueue[0];
 
-        if (req.confirmed && req.timeout < now - req.ts) {
-            this.openRequestsQueue.shift();
-            logger.debug(
-                `Timeout for request in openRequestsQueue addr: ${req.addr}, clusterId: ${req.clusterId.toString(16)}, profileId: ${req.profileId.toString(16)}, seq: ${req.transactionSequenceNumber}`,
-                NS,
-            );
-            req.reject(new Error("waiting for response TIMEOUT"));
+        for (let i = this.openRequestsQueue.length - 1; i >= 0; i--) {
+            const req: WaitForDataRequest = this.openRequestsQueue[i];
+
+            if (req.timeout < now - req.ts) {
+                this.openRequestsQueue.splice(i, 1);
+                logger.debug(
+                    `Timeout for request in openRequestsQueue addr: ${req.addr}, clusterId: ${req.clusterId.toString(16)}, profileId: ${req.profileId.toString(16)}, seq: ${req.transactionSequenceNumber}`,
+                    NS,
+                );
+                req.reject(new Error("waiting for response TIMEOUT"));
+            }
         }
     }
 
@@ -844,33 +848,15 @@ export class DeconzAdapter extends Adapter {
                 destinationEndpoint: resp.destEndpoint,
             };
 
-            this.waitress.resolve(payload);
+            if (payload.header !== undefined) {
+                this.waitress.resolve(payload as ZclWaitressPayload);
+            }
+
             this.emit("zclPayload", payload);
         }
     }
 
     private nextTransactionID(): number {
         return this.driver.nextTransactionID();
-    }
-
-    private waitressTimeoutFormatter(matcher: WaitressMatcher, timeout: number): string {
-        return (
-            `Timeout - ${matcher.address} - ${matcher.endpoint}` +
-            ` - ${matcher.transactionSequenceNumber} - ${matcher.clusterID}` +
-            ` - ${matcher.commandIdentifier} after ${timeout}ms`
-        );
-    }
-
-    private waitressValidator(payload: Events.ZclPayload, matcher: WaitressMatcher): boolean {
-        return Boolean(
-            payload.header &&
-                (!matcher.address || payload.address === matcher.address) &&
-                payload.endpoint === matcher.endpoint &&
-                (matcher.transactionSequenceNumber === undefined || payload.header.transactionSequenceNumber === matcher.transactionSequenceNumber) &&
-                payload.clusterID === matcher.clusterID &&
-                matcher.frameType === payload.header.frameControl.frameType &&
-                matcher.commandIdentifier === payload.header.commandIdentifier &&
-                matcher.direction === payload.header.frameControl.direction,
-        );
     }
 }

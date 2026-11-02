@@ -1,10 +1,11 @@
 import assert from "node:assert";
 import {platform} from "node:os";
-import type {PortInfo} from "@serialport/bindings-cpp";
-import {Bonjour, type Service} from "bonjour-service";
+import {autoDetect as autoDetectSerialPorts, type PortInfo} from "@serialport/bindings-cpp";
+import {Bonjour} from "bonjour-service";
+import type {Service} from "bonjour-service/dist/lib/service";
 import {wait} from "../utils";
 import {logger} from "../utils/logger";
-import {SerialPort} from "./serialPort";
+import type {TsType} from ".";
 import type {Adapter, DiscoverableUsbAdapter, UsbAdapterFingerprint} from "./tstype";
 
 const NS = "zh:adapter:discovery";
@@ -65,12 +66,40 @@ const USB_FINGERPRINTS: Record<DiscoverableUsbAdapter, UsbAdapterFingerprint[]> 
         //     pathRegex: '.*.*',
         // },
         {
-            // Home Assistant SkyConnect
+            // Home Assistant SkyConnect (pre ZBT-1 rename)
             vendorId: "10c4",
             productId: "ea60",
             manufacturer: "Nabu Casa",
             // /dev/serial/by-id/usb-Nabu_Casa_SkyConnect_v1.0_3abe54797c91ed118fc3cad13b20a111-if00-port0
             pathRegex: ".*Nabu_Casa_SkyConnect.*",
+            options: {rtscts: true},
+        },
+        {
+            // Home Assistant Connect ZBT-1
+            vendorId: "10c4",
+            productId: "ea60",
+            manufacturer: "Nabu Casa",
+            // ..Nabu_Casa_Home_Assistant_Connect_ZBT-1_..
+            pathRegex: ".*Nabu_Casa.*_ZBT-1.*",
+            options: {rtscts: true},
+        },
+        {
+            // Home Assistant Connect ZBT-2
+            vendorId: "303a",
+            productId: "4001",
+            manufacturer: "Nabu Casa",
+            // /dev/serial/by-id/usb-Nabu_Casa_ZBT-2_10B41DE58D6C-if00
+            pathRegex: ".*Nabu_Casa_ZBT-2.*",
+            options: {baudRate: 460800, rtscts: true},
+        },
+        {
+            // Home Assistant Connect ZBT-2
+            vendorId: "303a",
+            productId: "831a",
+            manufacturer: "Nabu Casa",
+            // /dev/serial/by-id/usb-Nabu_Casa_ZBT-2_10B41DE58D6C-if00
+            pathRegex: ".*Nabu_Casa_ZBT-2.*",
+            options: {baudRate: 460800, rtscts: true},
         },
         // {
         //     // TODO: Home Assistant Yellow
@@ -81,6 +110,14 @@ const USB_FINGERPRINTS: Record<DiscoverableUsbAdapter, UsbAdapterFingerprint[]> 
         //     pathRegex: '.*.*',
         // },
         {
+            // SMLight slzb-06m* (all variants) USB-mode
+            vendorId: "10c4",
+            productId: "ea60",
+            manufacturer: "SMLIGHT",
+            pathRegex: ".*slzb-06m.*",
+            options: {rtscts: false},
+        },
+        {
             // SMLight slzb-07
             vendorId: "10c4",
             productId: "ea60",
@@ -88,6 +125,7 @@ const USB_FINGERPRINTS: Record<DiscoverableUsbAdapter, UsbAdapterFingerprint[]> 
             // /dev/serial/by-id/usb-SMLIGHT_SMLIGHT_SLZB-07_be9faa0786e1ea11bd68dc2d9a583111-if00-port0
             // /dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_a215650c853bec119a079e957a0af111-if00-port0
             pathRegex: ".*slzb-07_.*", // `_` to not match 07p7
+            options: {rtscts: true},
         },
         {
             // SMLight slzb-07mg24
@@ -95,6 +133,7 @@ const USB_FINGERPRINTS: Record<DiscoverableUsbAdapter, UsbAdapterFingerprint[]> 
             productId: "ea60",
             manufacturer: "SMLIGHT",
             pathRegex: ".*slzb-07mg24.*",
+            options: {rtscts: true},
         },
         {
             // Sonoff ZBDongle-E V2 (CH variant)
@@ -104,6 +143,7 @@ const USB_FINGERPRINTS: Record<DiscoverableUsbAdapter, UsbAdapterFingerprint[]> 
             // /dev/serial/by-id/usb-ITEAD_SONOFF_Zigbee_3.0_USB_Dongle_Plus_V2_20240122184111-if00
             // /dev/serial/by-id/usb-ITead_Sonoff_Zigbee_3.0_USB_Dongle_Plus_186ff44314e2ed11b891eb5162c61111-if00-port0
             pathRegex: ".*sonoff.*plus.*",
+            options: {rtscts: false},
         },
         {
             // Sonoff ZBDongle-E V2 (CP variant)
@@ -112,6 +152,7 @@ const USB_FINGERPRINTS: Record<DiscoverableUsbAdapter, UsbAdapterFingerprint[]> 
             manufacturer: "ITEAD",
             // /dev/serial/by-id/usb-Itead_Sonoff_Zigbee_3.0_USB_Dongle_Plus_V2_a6ee897e4d1fef11aa004ad0639e525b-if00-port0
             pathRegex: ".*sonoff.*plus_v2_.*",
+            options: {rtscts: false},
         },
         {
             // Sonoff ZBDongle-M
@@ -120,6 +161,7 @@ const USB_FINGERPRINTS: Record<DiscoverableUsbAdapter, UsbAdapterFingerprint[]> 
             manufacturer: "SONOFF",
             // /dev/serial/by-id/usb-SONOFF_SONOFF_Dongle_Max_MG24_08965d6b0674ef11b2f4e61e313510fd-if00-port0
             pathRegex: ".*sonoff.*max.*",
+            options: {rtscts: false},
         },
         {
             // SONOFF Dongle Plus MG24
@@ -128,6 +170,7 @@ const USB_FINGERPRINTS: Record<DiscoverableUsbAdapter, UsbAdapterFingerprint[]> 
             manufacturer: "SONOFF",
             // /dev/serial/by-id/usb-SONOFF_SONOFF_Dongle_Plus_MG24_b023a583a66bef118e30a3adc169b110-if00-port0
             pathRegex: ".*sonoff.*plus.*mg24.*",
+            options: {rtscts: false},
         },
         {
             // SONOFF Dongle Lite MG21
@@ -136,6 +179,7 @@ const USB_FINGERPRINTS: Record<DiscoverableUsbAdapter, UsbAdapterFingerprint[]> 
             manufacturer: "SONOFF",
             // /dev/serial/by-id/usb-SONOFF_SONOFF_Dongle_Lite_MG21_c82fc0a1a36bef11a026a1adc169b110-if00-port0
             pathRegex: ".*sonoff.*lite.*mg21.*",
+            options: {rtscts: false},
         },
         // {
         //     // TODO: Z-station by z-wave.me (EFR32MG21A020F1024IM32)
@@ -161,6 +205,22 @@ const USB_FINGERPRINTS: Record<DiscoverableUsbAdapter, UsbAdapterFingerprint[]> 
             manufacturer: "Silicon Labs",
             // /dev/serial/by-id/usb-Silicon_Labs_slae.sh_cc2652rb_stick_-_slaesh_s_iot_stuff_00_12_4B_00_21_A8_EC_79-if00-port0
             pathRegex: ".*slae\\.sh_cc2652rb.*",
+        },
+        {
+            // SONOFF Dongle-MP10 (CC2674P10)
+            vendorId: "303a",
+            productId: "4001",
+            manufacturer: "SONOFF",
+            // /dev/serial/by-id/usb-SONOFF_SONOFF_Dongle_Max_CC2674P10_sonoff_dongle_mp10-80B54EDBBD8C-if00
+            pathRegex: ".*sonoff.*max.*cc2674p10.*",
+        },
+        {
+            // SONOFF Dongle-PP10 (CC2674P10)
+            vendorId: "10c4",
+            productId: "ea60",
+            manufacturer: "SONOFF",
+            // /dev/serial/by-id/usb-SONOFF_SONOFF_Dongle_Plus_CC2674P10_141ff85f6b12f011b6500514773d9da9-if00-port0
+            pathRegex: ".*sonoff.*plus.*cc2674p10.*",
         },
         {
             // Sonoff ZBDongle-P (CC2652P)
@@ -276,16 +336,11 @@ const USB_FINGERPRINTS: Record<DiscoverableUsbAdapter, UsbAdapterFingerprint[]> 
     ],
 };
 
-/**
- * Vendor and Product IDs that are prone to conflict if only matching on vendorId+productId.
- */
-const USB_FINGERPRINTS_CONFLICT_IDS: ReadonlyArray<string /* vendorId:productId */> = ["10c4:ea60"];
-
 /** Time allotted for mDNS scanning */
 const MDNS_SCAN_TIME = 2000;
 
 async function getSerialPortList(): Promise<PortInfo[]> {
-    const portInfos = await SerialPort.list();
+    const portInfos = await autoDetectSerialPorts().list();
 
     // TODO: can sorting be removed in favor of `path` regex matching?
 
@@ -296,6 +351,24 @@ async function getSerialPortList(): Promise<PortInfo[]> {
     portInfos.sort((a, b) => (a.path < b.path ? -1 : 1));
 
     return portInfos;
+}
+
+/**
+ * Match on Vendor and Product IDs that are prone to conflict if only matching on vendorId+productId.
+ * @param vendorId
+ * @param productId
+ * @returns True if conflict-prone
+ */
+function matchConflictProne(vendorId: string | undefined, productId: string | undefined): boolean {
+    if (!vendorId || !productId) {
+        return true; // can't match, no point looking it up (logic is expected to handle this further down the chain)
+    }
+
+    const lcVendorId = vendorId.toLowerCase();
+    const lcProductId = productId.toLowerCase();
+
+    // can add more check-pairs as needed
+    return lcVendorId === "10c4" && lcProductId === "ea60";
 }
 
 /**
@@ -323,7 +396,7 @@ function matchUsbFingerprint(
     entries: UsbAdapterFingerprint[],
     isWindows: boolean,
     conflictProne: boolean,
-): [path: PortInfo["path"], score: number] | undefined {
+): [path: PortInfo["path"], score: number, fingerprint: UsbAdapterFingerprint] | undefined {
     if (!portInfo.vendorId || !portInfo.productId) {
         // port info is missing essential information for proper matching, ignore it
         return undefined;
@@ -355,7 +428,7 @@ function matchUsbFingerprint(
             if (isWindows && !conflictProne) {
                 // path will never match on Windows (COMx), assume vendor+product+manufacturer is "exact match"
                 // except for conflict-prone, since it could easily return a mismatch (better to return no match and force manual config)
-                return [portInfo.path, score];
+                return [portInfo.path, score, match];
             }
         }
 
@@ -366,7 +439,7 @@ function matchUsbFingerprint(
         ) {
             if (score === UsbFingerprintMatchScore.VidPidManuf) {
                 // best possible match, return early
-                return [portInfo.path, UsbFingerprintMatchScore.VidPidManufPath];
+                return [portInfo.path, UsbFingerprintMatchScore.VidPidManufPath, entry];
             }
 
             match = entry;
@@ -383,18 +456,18 @@ function matchUsbFingerprint(
                 return undefined;
             }
 
-            return [portInfo.path, score];
+            return [portInfo.path, score, match];
         }
 
         if (!conflictProne) {
-            return [portInfo.path, score];
+            return [portInfo.path, score, match];
         }
     }
 
     return undefined;
 }
 
-export async function matchUsbAdapter(adapter: Adapter, path: string): Promise<boolean> {
+export async function matchUsbAdapter(adapter: Adapter, path: string): Promise<UsbAdapterFingerprint | false> {
     // no point in matching this
     if (adapter === "zoh") {
         return false;
@@ -410,12 +483,16 @@ export async function matchUsbAdapter(adapter: Adapter, path: string): Promise<b
             continue;
         }
 
-        const conflictProne = USB_FINGERPRINTS_CONFLICT_IDS.includes(`${portInfo.vendorId}:${portInfo.productId}`);
-        const match = matchUsbFingerprint(portInfo, USB_FINGERPRINTS[adapter === "ezsp" ? "ember" : adapter], isWindows, conflictProne);
+        const match = matchUsbFingerprint(
+            portInfo,
+            USB_FINGERPRINTS[adapter === "ezsp" ? "ember" : adapter],
+            isWindows,
+            matchConflictProne(portInfo.vendorId, portInfo.productId),
+        );
 
         if (match) {
             logger.info(() => `Matched adapter: ${JSON.stringify(portInfo)} => ${adapter}: ${JSON.stringify(match[1])}`, NS);
-            return true;
+            return match[2];
         }
     }
 
@@ -426,9 +503,9 @@ export function findUsbAdapterBestMatch(
     adapter: Adapter | undefined,
     portInfo: PortInfo,
     isWindows: boolean,
-    conflictProne: boolean,
 ): [DiscoverableUsbAdapter, NonNullable<ReturnType<typeof matchUsbFingerprint>>] | undefined {
     let bestMatch: [DiscoverableUsbAdapter, NonNullable<ReturnType<typeof matchUsbFingerprint>>] | undefined;
+    const conflictProne = matchConflictProne(portInfo.vendorId, portInfo.productId);
 
     for (const key in USB_FINGERPRINTS) {
         if (adapter && adapter !== key) {
@@ -452,10 +529,7 @@ export function findUsbAdapterBestMatch(
     return bestMatch;
 }
 
-export async function findUsbAdapter(
-    adapter?: Adapter,
-    path?: string,
-): Promise<[adapter: DiscoverableUsbAdapter, path: PortInfo["path"]] | undefined> {
+export async function findUsbAdapter(adapter?: Adapter, path?: string): Promise<TsType.TransportOptions | undefined> {
     const isWindows = platform() === "win32";
     // refine to DiscoverableUSBAdapter
     adapter = adapter && adapter === "ezsp" ? "ember" : adapter;
@@ -463,21 +537,33 @@ export async function findUsbAdapter(
 
     logger.debug(() => `Connected devices: ${JSON.stringify(portList)}`, NS);
 
+    let bestMatch: ReturnType<typeof findUsbAdapterBestMatch> | undefined;
+
     for (const portInfo of portList) {
         if (path && portInfo.path !== path) {
             continue;
         }
 
-        const conflictProne = USB_FINGERPRINTS_CONFLICT_IDS.includes(`${portInfo.vendorId}:${portInfo.productId}`);
-        const bestMatch = findUsbAdapterBestMatch(adapter, portInfo, isWindows, conflictProne);
+        const match = findUsbAdapterBestMatch(adapter, portInfo, isWindows);
 
-        if (bestMatch) {
-            logger.info(
-                () => `Matched adapter: ${JSON.stringify(portInfo)} => ${bestMatch[0]}: path=${bestMatch[1][0]}, score=${bestMatch[1][1]}`,
-                NS,
-            );
-            return [bestMatch[0], bestMatch[1][0]];
+        if (match && (!bestMatch || bestMatch[1][1] < match[1][1])) {
+            bestMatch = match;
+
+            if (match[1][1] === UsbFingerprintMatchScore.VidPidManufPath) {
+                // got best possible match, exit loop
+                break;
+            }
         }
+    }
+
+    if (bestMatch) {
+        logger.info(() => `Matched adapter=${bestMatch[0]} path=${bestMatch[1][0]}, score=${bestMatch[1][1]}`, NS);
+        return {
+            adapter: bestMatch[0],
+            path: bestMatch[1][0],
+            rtscts: bestMatch[1][2].options?.rtscts,
+            baudRate: bestMatch[1][2].options?.baudRate,
+        };
     }
 }
 
@@ -492,14 +578,16 @@ function getMdnsRadioAdapter(radio: string): Adapter {
     }
 }
 
-export async function findMdnsAdapter(path: string): Promise<[adapter: Adapter, path: string]> {
+export async function findMdnsAdapter(path: string): Promise<TsType.TransportOptions> {
     const mdnsDevice = path.substring(7);
 
     if (mdnsDevice.length === 0) {
         throw new Error("No mdns device specified. You must specify the coordinator mdns service type after mdns://, e.g. mdns://my-adapter");
     }
 
-    const bj = new Bonjour();
+    const bj = new Bonjour({}, (error: unknown) => {
+        throw new Error(`Failed to start mdns discovery: ${error}`);
+    });
 
     logger.info(`Starting mdns discovery for coordinator: ${mdnsDevice}`, NS);
 
@@ -516,7 +604,7 @@ export async function findMdnsAdapter(path: string): Promise<[adapter: Adapter, 
                     logger.info(`Coordinator Radio: ${mdnsAdapter}`, NS);
                     bj.destroy();
 
-                    resolve([mdnsAdapter, `tcp://${mdnsAddress}:${mdnsPort}`]);
+                    resolve({adapter: mdnsAdapter, path: `tcp://${mdnsAddress}:${mdnsPort}`});
                 } else {
                     bj.destroy();
                     reject(
@@ -533,7 +621,7 @@ export async function findMdnsAdapter(path: string): Promise<[adapter: Adapter, 
     });
 }
 
-export function findTcpAdapter(path: string, adapter?: Adapter): [adapter: Adapter, path: string] {
+export function findTcpAdapter(path: string, adapter?: Adapter): TsType.TransportOptions {
     try {
         const url = new URL(path);
         assert(url.port !== "");
@@ -546,7 +634,7 @@ export function findTcpAdapter(path: string, adapter?: Adapter): [adapter: Adapt
     }
 
     // always use `tcp://` format
-    return [adapter, path.replace(/^socket/, "tcp")];
+    return {adapter, path: path.replace(/^socket/, "tcp")};
 }
 
 /**
@@ -563,7 +651,7 @@ export function findTcpAdapter(path: string, adapter?: Adapter): [adapter: Adapt
  * @returns adapter An adapter type supported by Z2M. While result is TS-typed, this should be validated against actual values before use.
  * @returns path Path to adapter.
  */
-export async function discoverAdapter(adapter?: Adapter, path?: string): Promise<[adapter: Adapter, path: string]> {
+export async function discoverAdapter(adapter?: Adapter, path?: string): Promise<TsType.TransportOptions> {
     if (path) {
         if (path.startsWith("mdns://")) {
             return await findMdnsAdapter(path);
@@ -574,17 +662,21 @@ export async function discoverAdapter(adapter?: Adapter, path?: string): Promise
         }
 
         if (adapter) {
+            const result: TsType.TransportOptions = {adapter, path};
             try {
                 const matched = await matchUsbAdapter(adapter, path);
 
                 if (!matched) {
                     logger.debug(`Unable to match USB adapter: ${adapter} | ${path}`, NS);
+                } else {
+                    result.rtscts = matched.options?.rtscts;
+                    result.baudRate = matched.options?.baudRate;
                 }
             } catch (error) {
                 logger.debug(`Error while trying to match USB adapter (${(error as Error).message}).`, NS);
             }
 
-            return [adapter, path];
+            return result;
         }
     }
 
@@ -597,17 +689,19 @@ export async function discoverAdapter(adapter?: Adapter, path?: string): Promise
         }
 
         // keep adapter if `ezsp` since findUSBAdapter returns DiscoverableUSBAdapter
-        return adapter && adapter === "ezsp" ? [adapter, match[1]] : match;
+        return adapter && adapter === "ezsp" ? {adapter, path: match.path, baudRate: match.baudRate, rtscts: match.rtscts} : match;
     } catch (error) {
         throw new Error(`USB adapter discovery error (${(error as Error).message}). Specify valid 'adapter' and 'port' in your configuration.`);
     }
 }
 
+type AllDevices = (TsType.TransportOptions & {name: string; path: string})[];
+
 /**
  * @returns List of all serial and mDNS devices found, with matching `adapter` if available
  */
-export async function findAllDevices(): Promise<{name: string; path: string; adapter?: Adapter}[]> {
-    const devices: {name: string; path: string; adapter?: Adapter}[] = [];
+export async function findAllDevices(): Promise<AllDevices> {
+    const devices: AllDevices = [];
     const isWindows = platform() === "win32";
 
     try {
@@ -615,31 +709,45 @@ export async function findAllDevices(): Promise<{name: string; path: string; ada
 
         for (const portInfo of portList) {
             // override matching on Windows, too many chances of mismatch due to lacking data
-            const bestMatch = isWindows
-                ? undefined
-                : findUsbAdapterBestMatch(
-                      undefined,
-                      portInfo,
-                      isWindows,
-                      USB_FINGERPRINTS_CONFLICT_IDS.includes(`${portInfo.vendorId}:${portInfo.productId}`),
-                  );
+            const bestMatch = isWindows ? undefined : findUsbAdapterBestMatch(undefined, portInfo, isWindows);
             // @ts-expect-error friendlyName Windows only
             const friendlyName = portInfo.friendlyName ?? portInfo.pnpId;
-
-            devices.push({
+            const device: AllDevices[number] = {
                 name: `${friendlyName} (${portInfo.manufacturer})`,
                 path: portInfo.path,
-                adapter: bestMatch ? bestMatch[0] : undefined,
-            });
+            };
+
+            if (bestMatch) {
+                const adapter = bestMatch[0];
+                const options = bestMatch[1][2].options;
+
+                if (adapter) {
+                    device.adapter = adapter;
+                }
+
+                if (options) {
+                    if (options.baudRate !== undefined) {
+                        device.baudRate = options.baudRate;
+                    }
+
+                    if (options.rtscts !== undefined) {
+                        device.rtscts = options.rtscts;
+                    }
+                }
+            }
+
+            devices.push(device);
         }
-        /* v8 ignore start */
     } catch (error) {
         logger.debug(`Failed to retrieve serial list ${(error as Error).message}.`, NS);
     }
-    /* v8 ignore stop */
+
+    let bonjour: Bonjour | undefined;
 
     try {
-        const bonjour = new Bonjour();
+        bonjour = new Bonjour({}, (error: unknown) => {
+            throw new Error(`${error}`);
+        });
         const browser = bonjour.find(null, (service) => {
             if (service.txt?.radio_type) {
                 const path = `tcp://${service.addresses?.[0] ?? service.host}:${service.port}`;
@@ -655,12 +763,11 @@ export async function findAllDevices(): Promise<{name: string; path: string; ada
         browser.start();
         await wait(MDNS_SCAN_TIME);
         browser.stop();
-        bonjour.destroy();
-        /* v8 ignore start */
     } catch (error) {
         logger.debug(`Failed to retrieve mDNS list ${(error as Error).message}.`, NS);
+    } finally {
+        bonjour?.destroy();
     }
-    /* v8 ignore stop */
 
     return devices;
 }

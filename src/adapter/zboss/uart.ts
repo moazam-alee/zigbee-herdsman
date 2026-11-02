@@ -1,50 +1,77 @@
 /* v8 ignore start */
 
 import EventEmitter from "node:events";
-import {Socket} from "node:net";
-
-import {Queue, Waitress, wait} from "../../utils";
+import {Waitress, wait} from "../../utils";
+import {AsyncMutex} from "../../utils/async-mutex";
 import {logger} from "../../utils/logger";
-import {SerialPort} from "../serialPort";
-import type {SerialPortOptions} from "../tstype";
-import {isTcpPath, parseTcpPath} from "../utils";
+import type {AdapterTransport} from "../transport";
 import {SIGNATURE, ZBOSS_FLAG_FIRST_FRAGMENT, ZBOSS_FLAG_LAST_FRAGMENT, ZBOSS_NCP_API_HL} from "./consts";
 import {readZBOSSFrame, writeZBOSSFrame, type ZBOSSFrame} from "./frame";
-import {ZBOSSReader} from "./reader";
 import {crc8, crc16} from "./utils";
-import {ZBOSSWriter} from "./writer";
 
 const NS = "zh:zboss:uart";
 
 export class ZBOSSUart extends EventEmitter {
-    private readonly portOptions: SerialPortOptions;
-    private serialPort?: SerialPort;
-    private socketPort?: Socket;
-    private writer: ZBOSSWriter;
-    private reader: ZBOSSReader;
-    private closing = false;
+    private readonly transport: AdapterTransport;
+    private inputBuffer = Buffer.alloc(0);
     private sendSeq = 0; // next frame number to send
     private recvSeq = 0; // next frame number to receive
     private ackSeq = 0; // next number after the last accepted frame
     private waitress: Waitress<number, number>;
-    private queue: Queue;
+    private queue: AsyncMutex;
     public inReset = false;
 
-    constructor(options: SerialPortOptions) {
+    constructor(transport: AdapterTransport) {
         super();
 
-        this.portOptions = options;
-        this.serialPort = undefined;
-        this.socketPort = undefined;
-        this.writer = new ZBOSSWriter();
-        this.reader = new ZBOSSReader();
-        this.reader.on("data", this.onPackage.bind(this));
-        this.queue = new Queue(1);
+        this.transport = transport;
+        this.queue = new AsyncMutex();
         this.waitress = new Waitress<number, number>(this.waitressValidator, this.waitressTimeoutFormatter);
+
+        this.transport.on("data", this.onTransportData.bind(this));
+        // NOTE: `Adapter` will also emit `disconnected` for this, but since no listener yet, only this logic gets executed
+        this.transport.on("close", async () => {
+            if (this.inReset) {
+                await wait(3000);
+                await this.transport.open(true);
+                this.inReset = false;
+            }
+        });
     }
 
-    public async resetNcp(): Promise<boolean> {
-        if (this.closing) {
+    private onTransportData(chunk: Buffer): void {
+        let data = Buffer.concat([this.inputBuffer, chunk]);
+        // SIGNATURE - start of package
+        let position = data.indexOf(SIGNATURE);
+
+        while (position !== -1) {
+            // need for read length
+            if (data.length <= position + 3) {
+                break;
+            }
+
+            const length = data.readUInt16LE(position + 1);
+
+            if (data.length < position + 1 + length) {
+                break;
+            }
+
+            this.onFrame(data.subarray(position + 1, position + 1 + length)).catch((error) => {
+                logger.debug(`<-- error ${(error as Error).stack}`, NS);
+            });
+
+            data = data.subarray(position + 1 + length);
+            position = data.indexOf(SIGNATURE);
+        }
+        this.inputBuffer = data;
+    }
+
+    get portOpen(): boolean | undefined {
+        return this.transport.isOpen;
+    }
+
+    public async start(): Promise<boolean> {
+        if (this.transport.isClosing) {
             return false;
         }
 
@@ -52,7 +79,7 @@ export class ZBOSSUart extends EventEmitter {
 
         try {
             if (!this.portOpen) {
-                await this.openPort();
+                await this.transport.open(true);
             }
 
             return true;
@@ -63,152 +90,27 @@ export class ZBOSSUart extends EventEmitter {
         }
     }
 
-    get portOpen(): boolean | undefined {
-        if (this.closing) {
-            return false;
-        }
-        // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-        if (isTcpPath(this.portOptions.path!)) {
-            return this.socketPort && !this.socketPort.closed;
-        }
-
-        return this.serialPort?.isOpen;
-    }
-
-    public async start(): Promise<boolean> {
-        if (!this.portOpen) {
-            return false;
-        }
-
-        logger.info("UART starting", NS);
-
-        try {
-            if (this.serialPort != null) {
-                // clear read/write buffers
-                await this.serialPort.asyncFlush();
-            }
-        } catch (err) {
-            logger.error(`Error while flushing before start: ${err}`, NS);
-        }
-
-        return true;
-    }
-
     public async stop(): Promise<void> {
-        this.closing = true;
         this.queue.clear();
-        await this.closePort();
-        this.closing = false;
+        await this.transport.close();
         logger.info("UART stopped", NS);
     }
 
-    private async openPort(): Promise<void> {
-        await this.closePort();
-
-        // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-        if (!isTcpPath(this.portOptions.path!)) {
-            const serialOpts = {
-                // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-                path: this.portOptions.path!,
-                baudRate: typeof this.portOptions.baudRate === "number" ? this.portOptions.baudRate : 115200,
-                rtscts: typeof this.portOptions.rtscts === "boolean" ? this.portOptions.rtscts : false,
-                autoOpen: false,
-            };
-
-            //@ts-expect-error Jest testing
-            if (this.portOptions.binding != null) {
-                //@ts-expect-error Jest testing
-                serialOpts.binding = this.portOptions.binding;
-            }
-
-            logger.debug(`Opening serial port with ${JSON.stringify(serialOpts)}`, NS);
-            this.serialPort = new SerialPort(serialOpts);
-
-            this.writer.pipe(this.serialPort);
-
-            this.serialPort.pipe(this.reader);
-
-            try {
-                await this.serialPort.asyncOpen();
-                logger.info("Serial port opened", NS);
-
-                this.serialPort.once("close", this.onPortClose.bind(this));
-                this.serialPort.on("error", this.onPortError.bind(this));
-            } catch (error) {
-                await this.stop();
-
-                throw error;
-            }
-        } else {
-            // biome-ignore lint/style/noNonNullAssertion: ignored using `--suppress`
-            const info = parseTcpPath(this.portOptions.path!);
-            logger.debug(`Opening TCP socket with ${info.host}:${info.port}`, NS);
-
-            this.socketPort = new Socket();
-            this.socketPort.setNoDelay(true);
-            this.socketPort.setKeepAlive(true, 15000);
-
-            this.writer.pipe(this.socketPort);
-
-            this.socketPort.pipe(this.reader);
-
-            return await new Promise((resolve, reject): void => {
-                const openError = async (err: Error): Promise<void> => {
-                    await this.stop();
-
-                    reject(err);
-                };
-
-                this.socketPort?.on("connect", () => {
-                    logger.debug("Socket connected", NS);
-                });
-                this.socketPort?.on("ready", (): void => {
-                    logger.info("Socket ready", NS);
-                    this.socketPort?.removeListener("error", openError);
-                    this.socketPort?.once("close", this.onPortClose.bind(this));
-                    this.socketPort?.on("error", this.onPortError.bind(this));
-
-                    resolve();
-                });
-                this.socketPort?.once("error", openError);
-
-                this.socketPort?.connect(info.port, info.host);
-            });
-        }
-    }
-
-    public async closePort(): Promise<void> {
-        if (this.serialPort?.isOpen) {
-            try {
-                await this.serialPort.asyncFlushAndClose();
-            } catch (err) {
-                logger.error(`Failed to close serial port ${err}.`, NS);
-            }
-
-            this.serialPort.removeAllListeners();
-            this.serialPort = undefined;
-        } else if (this.socketPort !== undefined && !this.socketPort.closed) {
-            this.socketPort.destroy();
-            this.socketPort.removeAllListeners();
-            this.socketPort = undefined;
-        }
-    }
-
-    private async onPortClose(err: boolean | Error): Promise<void> {
-        logger.info(`Port closed. Error? ${err ?? "no"}`, NS);
-        if (this.inReset) {
-            await wait(3000);
-            await this.openPort();
-            this.inReset = false;
-        }
-    }
-
-    private onPortError(error: Error): void {
-        logger.info(`Port error: ${error}`, NS);
-    }
-
-    private async onPackage(data: Buffer): Promise<void> {
-        if (this.inReset) return;
+    private async onFrame(data: Buffer): Promise<void> {
+        // Do not drop frames while `inReset` is set.
+        //
+        // `inReset` is set by `reset()` and only cleared by `onPortClose`
+        // (after a 3s wait + reopen). On some NCP transports the underlying
+        // port does not reliably close around `esp_restart()` (e.g. ESP32-C6
+        // USB-Serial-JTAG re-attaches the same CDC descriptor essentially
+        // instantly), so `onPortClose` never fires, `inReset` never clears,
+        // and the device's tsn-matching NCP_RESET response plus the
+        // post-reboot boot-ready frame both get silently dropped here.
+        // `Driver.execCommand(NCP_RESET, ...)` already uses an undefined-tsn
+        // waitress matcher, so either frame would resolve the pending
+        // promise if it reached the `"frame"` emitter. The CRC8/CRC16 checks below
+        // reject any garbage (ROM banner ASCII, partial frames, electrical
+        // noise) that legitimately arrives during the reset window.
         const len = data.readUInt16LE(0);
         const pType = data.readUInt8(2);
         const pFlags = data.readUInt8(3);
@@ -307,7 +209,7 @@ export class ZBOSSUart extends EventEmitter {
         const nextSeq = this.sendSeq;
         const ackSeq = this.recvSeq;
 
-        return await this.queue.execute<void>(async (): Promise<void> => {
+        return await this.queue.run<void>(async (): Promise<void> => {
             try {
                 logger.debug(`--> DATA (${seq},${ackSeq},0): ${data.toString("hex")}`, NS);
                 if (!isACK) {
@@ -392,7 +294,7 @@ export class ZBOSSUart extends EventEmitter {
 
     private writeBuffer(buffer: Buffer): void {
         logger.debug(`--> [${buffer.toString("hex")}]`, NS);
-        this.writer.push(buffer);
+        this.transport.write(buffer);
     }
 
     private makePack(flags: number, data?: Buffer): Buffer {

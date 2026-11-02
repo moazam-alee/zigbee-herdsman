@@ -1,17 +1,22 @@
 import {Buffalo} from "../../buffalo";
-import {logger} from "../../utils/logger";
 import {isNumberArray} from "../../utils/utils";
+import {ZCL_TYPE_INVALID_BY_TYPE, ZclType} from "./definition/datatypes";
 import {BuffaloZclDataType, DataType, StructuredIndicatorType} from "./definition/enums";
 import type {
     BuffaloZclOptions,
     ExtensionFieldSet,
     Gpd,
     GpdAttributeReport,
+    GpdAttributeReporting,
     GpdChannelConfiguration,
     GpdChannelRequest,
     GpdCommissioningReply,
     GpdCustomReply,
-    KeyZclValue,
+    GpdManufAttributeReport,
+    GpdManufMultiClusterAttributeReport,
+    GpdMultiClusterAttributeReport,
+    GpdReadAttributeResponse,
+    GpdRequestAttribute,
     MiboxerZone,
     Struct,
     StructuredSelector,
@@ -23,8 +28,10 @@ import type {
     ZoneInfo,
 } from "./definition/tstype";
 import * as Utils from "./utils";
+import {getClusterAttribute} from "./utils";
 
-const NS = "zh:zcl:buffalo";
+const UINT8_NON_VALUE = ZCL_TYPE_INVALID_BY_TYPE[ZclType.Uint8] as number;
+const UINT16_NON_VALUE = ZCL_TYPE_INVALID_BY_TYPE[ZclType.Uint16] as number;
 
 const SEC_KEY_LENGTH = 16;
 
@@ -35,197 +42,34 @@ const EXTENSION_FIELD_SETS_DATA_TYPE: {[key: number]: DataType[]} = {
     768: [DataType.UINT16, DataType.UINT16, DataType.UINT16, DataType.UINT8, DataType.UINT8, DataType.UINT8, DataType.UINT16, DataType.UINT16],
 };
 
-// UINT8_TMP_FIX: temporary return 0xff instead of Number.NaN
-// Will be replaced by https://github.com/Koenkk/zigbee-herdsman/pull/1503
-// https://github.com/Koenkk/zigbee-herdsman/issues/1498
-// https://github.com/Koenkk/zigbee-herdsman/pull/1510
-
 export class BuffaloZcl extends Buffalo {
-    private writeZclUInt8(value: number): void {
-        this.writeUInt8(value);
-        // See UINT8_TMP_FIX
-        // this.writeUInt8(Number.isNaN(value) ? 0xff : value);
-    }
-
-    private readZclUInt8(): number {
+    private readLengthUInt8(): number {
         const value = this.readUInt8();
 
-        return value;
-
-        // See UINT8_TMP_FIX
-        // return value === 0xff ? Number.NaN : value;
+        return value === UINT8_NON_VALUE ? Number.NaN : value;
     }
 
-    private writeZclUInt16(value: number): void {
-        this.writeUInt16(Number.isNaN(value) ? 0xffff : value);
-    }
-
-    private readZclUInt16(): number {
+    private readLengthUInt16(): number {
         const value = this.readUInt16();
 
-        return value === 0xffff ? Number.NaN : value;
-    }
-
-    private writeZclUInt24(value: number): void {
-        this.writeUInt24(Number.isNaN(value) ? 0xffffff : value);
-    }
-
-    private readZclUInt24(): number {
-        const value = this.readUInt24();
-
-        return value === 0xffffff ? Number.NaN : value;
-    }
-
-    private writeZclUInt32(value: number): void {
-        this.writeUInt32(Number.isNaN(value) ? 0xffffffff : value);
-    }
-
-    private readZclUInt32(): number {
-        const value = this.readUInt32();
-
-        return value === 0xffffffff ? Number.NaN : value;
-    }
-
-    private writeZclUInt40(value: number): void {
-        this.writeUInt40(Number.isNaN(value) ? 0xffffffffff : value);
-    }
-
-    private readZclUInt40(): number {
-        const value = this.readUInt40();
-
-        return value === 0xffffffffff ? Number.NaN : value;
-    }
-
-    private writeZclUInt48(value: number): void {
-        this.writeUInt48(Number.isNaN(value) ? 0xffffffffffff : value);
-    }
-
-    private readZclUInt48(): number {
-        const value = this.readUInt48();
-
-        return value === 0xffffffffffff ? Number.NaN : value;
-    }
-
-    private writeZclUInt56(value: bigint | undefined): void {
-        this.writeUInt56(value === undefined ? 0xffffffffffffffn : value);
-    }
-
-    private readZclUInt56(): bigint | undefined {
-        const value = this.readUInt56();
-
-        return value === 0xffffffffffffffn ? undefined : value;
-    }
-
-    private writeZclUInt64(value: bigint | undefined): void {
-        this.writeUInt64(value === undefined ? 0xffffffffffffffffn : value);
-    }
-
-    private readZclUInt64(): bigint | undefined {
-        const value = this.readUInt64();
-
-        return value === 0xffffffffffffffffn ? undefined : value;
-    }
-
-    private writeZclInt8(value: number): void {
-        this.writeInt8(Number.isNaN(value) ? -0x80 : value);
-    }
-
-    private readZclInt8(): number {
-        const value = this.readInt8();
-
-        return value === -0x80 ? Number.NaN : value;
-    }
-
-    private writeZclInt16(value: number): void {
-        this.writeInt16(Number.isNaN(value) ? -0x8000 : value);
-    }
-
-    private readZclInt16(): number {
-        const value = this.readInt16();
-
-        return value === -0x8000 ? Number.NaN : value;
-    }
-
-    private writeZclInt24(value: number): void {
-        this.writeInt24(Number.isNaN(value) ? -0x800000 : value);
-    }
-
-    private readZclInt24(): number {
-        const value = this.readInt24();
-
-        return value === -0x800000 ? Number.NaN : value;
-    }
-
-    private writeZclInt32(value: number): void {
-        this.writeInt32(Number.isNaN(value) ? -0x80000000 : value);
-    }
-
-    private readZclInt32(): number {
-        const value = this.readInt32();
-
-        return value === -0x80000000 ? Number.NaN : value;
-    }
-
-    private writeZclInt40(value: number): void {
-        this.writeInt40(Number.isNaN(value) ? -0x8000000000 : value);
-    }
-
-    private readZclInt40(): number {
-        const value = this.readInt40();
-
-        return value === -0x8000000000 ? Number.NaN : value;
-    }
-
-    private writeZclInt48(value: number): void {
-        this.writeInt48(Number.isNaN(value) ? -0x800000000000 : value);
-    }
-
-    private readZclInt48(): number {
-        const value = this.readInt48();
-
-        return value === -0x800000000000 ? Number.NaN : value;
-    }
-
-    private writeZclInt56(value: bigint | undefined): void {
-        this.writeInt56(value === undefined ? -0x80000000000000n : value);
-    }
-
-    private readZclInt56(): bigint | undefined {
-        const value = this.readInt56();
-
-        return value === -0x80000000000000n ? undefined : value;
-    }
-
-    private writeZclInt64(value: bigint | undefined): void {
-        this.writeInt64(value === undefined ? -0x8000000000000000n : value);
-    }
-
-    private readZclInt64(): bigint | undefined {
-        const value = this.readInt64();
-
-        return value === -0x8000000000000000n ? undefined : value;
+        return value === UINT16_NON_VALUE ? Number.NaN : value;
     }
 
     private writeOctetStr(value?: number[]): void {
         if (value) {
             this.writeUInt8(value.length);
             this.writeBuffer(value, value.length);
-            /* v8 ignore start */
         } else {
-            // ignore because of UINT8_TMP_FIX
-            this.writeUInt8(0xff); // non-value
+            this.writeUInt8(UINT8_NON_VALUE);
         }
-        /* v8 ignore stop */
     }
 
     private readOctetStr(): Buffer {
-        const length = this.readZclUInt8();
-
-        // See UINT8_TMP_FIX
-        return length < 0xff ? this.readBuffer(length) : Buffer.from([]); // non-value
-        // return Number.isNaN(length) ? Buffer.from([]) : this.readBuffer(length);
+        const length = this.readLengthUInt8();
+        return Number.isNaN(length) ? Buffer.from([]) : this.readBuffer(length);
     }
 
+    // TODO: support read/write with specific `length` from attribute metadata (CHAR_STR & LONG_CHAR_STR)
     private writeCharStr(value?: string | number[]): void {
         // In case of an empty string, send 0 length, from the spec:
         // "Setting this sub-field to 0x00 represents a character string with no character data (an “empty string”). Setting
@@ -239,16 +83,14 @@ export class BuffaloZcl extends Buffalo {
                 this.writeBuffer(value, value.length);
             }
         } else {
-            this.writeUInt8(0xff); // non-value
+            this.writeUInt8(UINT8_NON_VALUE);
         }
     }
 
     private readCharStr(): string {
-        const length = this.readZclUInt8();
+        const length = this.readLengthUInt8();
 
-        // See UINT8_TMP_FIX
-        return length < 0xff ? this.readUtf8String(length) : ""; // non-value
-        // return Number.isNaN(length) ? "" : this.readUtf8String(length);
+        return Number.isNaN(length) ? "" : this.readUtf8String(length);
     }
 
     private writeLongOctetStr(value?: number[]): void {
@@ -256,12 +98,12 @@ export class BuffaloZcl extends Buffalo {
             this.writeUInt16(value.length);
             this.writeBuffer(value, value.length);
         } else {
-            this.writeUInt16(0xffff); // non-value
+            this.writeUInt16(UINT16_NON_VALUE);
         }
     }
 
     private readLongOctetStr(): Buffer {
-        const length = this.readZclUInt16();
+        const length = this.readLengthUInt16();
         return Number.isNaN(length) ? Buffer.from([]) : this.readBuffer(length);
     }
 
@@ -274,12 +116,12 @@ export class BuffaloZcl extends Buffalo {
             this.writeUInt16(Buffer.byteLength(value, "utf8"));
             this.writeUtf8String(value);
         } else {
-            this.writeUInt16(0xffff); // non-value
+            this.writeUInt16(UINT16_NON_VALUE);
         }
     }
 
     private readLongCharStr(): string {
-        const length = this.readZclUInt16();
+        const length = this.readLengthUInt16();
         return Number.isNaN(length) ? "" : this.readUtf8String(length);
     }
 
@@ -294,15 +136,16 @@ export class BuffaloZcl extends Buffalo {
             }
         } else {
             this.writeUInt8(DataType.NO_DATA); // XXX: correct value?
-            this.writeUInt16(0xffff); // non-value
+            this.writeUInt16(UINT16_NON_VALUE);
         }
     }
 
+    // TODO: support read [] with specific length (`arrayLengthSize` & `arrayLengthField`) from parameter metadata
     private readArray(): unknown[] {
         const values: unknown[] = [];
 
         const elementType = this.readUInt8();
-        const numberOfElements = this.readZclUInt16();
+        const numberOfElements = this.readLengthUInt16();
 
         if (!Number.isNaN(numberOfElements)) {
             // not non-value
@@ -324,13 +167,13 @@ export class BuffaloZcl extends Buffalo {
                 this.write(v.elmType, v.elmVal, {});
             }
         } else {
-            this.writeUInt16(0xffff); // non-value
+            this.writeUInt16(UINT16_NON_VALUE);
         }
     }
 
     private readStruct(): Struct[] {
         const values: Struct[] = [];
-        const numberOfElements = this.readZclUInt16();
+        const numberOfElements = this.readLengthUInt16();
 
         if (!Number.isNaN(numberOfElements)) {
             // not non-value
@@ -345,17 +188,17 @@ export class BuffaloZcl extends Buffalo {
     }
 
     private writeToD(value: ZclTimeOfDay): void {
-        this.writeUInt8(value.hours == null || Number.isNaN(value.hours) ? 0xff : value.hours);
-        this.writeUInt8(value.minutes == null || Number.isNaN(value.minutes) ? 0xff : value.minutes);
-        this.writeUInt8(value.seconds == null || Number.isNaN(value.seconds) ? 0xff : value.seconds);
-        this.writeUInt8(value.hundredths == null || Number.isNaN(value.hundredths) ? 0xff : value.hundredths);
+        this.writeUInt8(value.hours == null || Number.isNaN(value.hours) ? UINT8_NON_VALUE : value.hours);
+        this.writeUInt8(value.minutes == null || Number.isNaN(value.minutes) ? UINT8_NON_VALUE : value.minutes);
+        this.writeUInt8(value.seconds == null || Number.isNaN(value.seconds) ? UINT8_NON_VALUE : value.seconds);
+        this.writeUInt8(value.hundredths == null || Number.isNaN(value.hundredths) ? UINT8_NON_VALUE : value.hundredths);
     }
 
     private readToD(): ZclTimeOfDay {
-        const hours = this.readZclUInt8();
-        const minutes = this.readZclUInt8();
-        const seconds = this.readZclUInt8();
-        const hundredths = this.readZclUInt8();
+        const hours = this.readLengthUInt8();
+        const minutes = this.readLengthUInt8();
+        const seconds = this.readLengthUInt8();
+        const hundredths = this.readLengthUInt8();
 
         return {
             hours,
@@ -366,17 +209,17 @@ export class BuffaloZcl extends Buffalo {
     }
 
     private writeDate(value: ZclDate): void {
-        this.writeUInt8(value.year == null || Number.isNaN(value.year) ? 0xff : value.year - 1900);
-        this.writeUInt8(value.month == null || Number.isNaN(value.month) ? 0xff : value.month);
-        this.writeUInt8(value.dayOfMonth == null || Number.isNaN(value.dayOfMonth) ? 0xff : value.dayOfMonth);
-        this.writeUInt8(value.dayOfWeek == null || Number.isNaN(value.dayOfWeek) ? 0xff : value.dayOfWeek);
+        this.writeUInt8(value.year == null || Number.isNaN(value.year) ? UINT8_NON_VALUE : value.year - 1900);
+        this.writeUInt8(value.month == null || Number.isNaN(value.month) ? UINT8_NON_VALUE : value.month);
+        this.writeUInt8(value.dayOfMonth == null || Number.isNaN(value.dayOfMonth) ? UINT8_NON_VALUE : value.dayOfMonth);
+        this.writeUInt8(value.dayOfWeek == null || Number.isNaN(value.dayOfWeek) ? UINT8_NON_VALUE : value.dayOfWeek);
     }
 
     private readDate(): ZclDate {
-        const year = this.readZclUInt8();
-        const month = this.readZclUInt8();
-        const dayOfMonth = this.readZclUInt8();
-        const dayOfWeek = this.readZclUInt8();
+        const year = this.readLengthUInt8();
+        const month = this.readLengthUInt8();
+        const dayOfMonth = this.readLengthUInt8();
+        const dayOfWeek = this.readLengthUInt8();
 
         return {
             year: year + 1900, // remains NaN if year is NaN
@@ -447,11 +290,11 @@ export class BuffaloZcl extends Buffalo {
             this.writeUInt16(entry.transitionTime);
 
             if (entry.heatSetpoint != null) {
-                this.writeUInt16(entry.heatSetpoint);
+                this.writeInt16(entry.heatSetpoint);
             }
 
             if (entry.coolSetpoint != null) {
-                this.writeUInt16(entry.coolSetpoint);
+                this.writeInt16(entry.coolSetpoint);
             }
         }
     }
@@ -471,11 +314,11 @@ export class BuffaloZcl extends Buffalo {
             };
 
             if (heat) {
-                entry.heatSetpoint = this.readUInt16();
+                entry.heatSetpoint = this.readInt16();
             }
 
             if (cool) {
-                entry.coolSetpoint = this.readUInt16();
+                entry.coolSetpoint = this.readInt16();
             }
 
             result.push(entry);
@@ -536,7 +379,9 @@ export class BuffaloZcl extends Buffalo {
         // 0xf6: ZCL Tunneling
     }
 
-    private readGpdFrame(options: BuffaloZclOptions): Gpd | GpdChannelRequest | GpdAttributeReport | {raw: Buffer} | Record<string, never> {
+    private readGpdFrame(
+        options: BuffaloZclOptions,
+    ): Gpd | GpdChannelRequest | GpdAttributeReporting | GpdRequestAttribute | GpdReadAttributeResponse | {raw: Buffer} | Record<string, never> {
         if (options.payload?.payloadSize === undefined) {
             throw new Error("Cannot read GPD_FRAME without required payload options specified");
         }
@@ -548,137 +393,264 @@ export class BuffaloZcl extends Buffalo {
         // ensure offset by options.payload.payloadSize (if any) at end of parsing to not cause issues with spec changes (until supported)
         const startPosition = this.position;
 
-        if (options.payload.commandID === 0xe0) {
-            // Commisioning
-            const frame = {
-                deviceID: this.readUInt8(),
-                options: this.readUInt8(),
-                extendedOptions: 0,
-                securityKey: Buffer.alloc(16) as Buffer<ArrayBufferLike>,
-                keyMic: 0,
-                outgoingCounter: 0,
-                applicationInfo: 0,
-                manufacturerID: 0,
-                modelID: 0,
-                numGpdCommands: 0,
-                gpdCommandIdList: Buffer.alloc(0) as Buffer<ArrayBufferLike>,
-                numServerClusters: 0,
-                numClientClusters: 0,
-                gpdServerClusters: Buffer.alloc(0) as Buffer<ArrayBufferLike>,
-                gpdClientClusters: Buffer.alloc(0) as Buffer<ArrayBufferLike>,
-                genericSwitchConfig: 0,
-                currentContactStatus: 0,
-            };
+        switch (options.payload.commandID) {
+            case 0xe0: {
+                // Commisioning
+                const frame: Gpd = {
+                    deviceID: this.readUInt8(),
+                    options: this.readUInt8(),
+                    extendedOptions: 0,
+                    securityKey: Buffer.alloc(16) as Buffer<ArrayBufferLike>,
+                    keyMic: 0,
+                    outgoingCounter: 0,
+                    applicationInfo: 0,
+                    manufacturerID: 0,
+                    modelID: 0,
+                    numGpdCommands: 0,
+                    gpdCommandIdList: Buffer.alloc(0) as Buffer<ArrayBufferLike>,
+                    numServerClusters: 0,
+                    numClientClusters: 0,
+                    gpdServerClusters: Buffer.alloc(0) as Buffer<ArrayBufferLike>,
+                    gpdClientClusters: Buffer.alloc(0) as Buffer<ArrayBufferLike>,
+                    genericSwitchConfig: 0,
+                    currentContactStatus: 0,
+                };
 
-            if (frame.options & 0x80) {
-                frame.extendedOptions = this.readUInt8();
-            }
-
-            if (frame.extendedOptions & 0x20) {
-                frame.securityKey = this.readBuffer(16);
-            }
-
-            if (frame.extendedOptions & 0x40) {
-                frame.keyMic = this.readUInt32();
-            }
-
-            if (frame.extendedOptions & 0x80) {
-                frame.outgoingCounter = this.readUInt32();
-            }
-
-            if (frame.options & 0x04) {
-                frame.applicationInfo = this.readUInt8();
-            }
-
-            if (frame.applicationInfo & 0x01) {
-                frame.manufacturerID = this.readUInt16();
-            }
-
-            if (frame.applicationInfo & 0x02) {
-                frame.modelID = this.readUInt16();
-            }
-
-            if (frame.applicationInfo & 0x04) {
-                frame.numGpdCommands = this.readUInt8();
-                frame.gpdCommandIdList = this.readBuffer(frame.numGpdCommands);
-            }
-
-            if (frame.applicationInfo & 0x08) {
-                const len = this.readUInt8();
-                frame.numServerClusters = len & 0xf;
-                frame.numClientClusters = (len >> 4) & 0xf;
-
-                frame.gpdServerClusters = this.readBuffer(2 * frame.numServerClusters);
-                frame.gpdClientClusters = this.readBuffer(2 * frame.numClientClusters);
-            }
-
-            if (frame.applicationInfo & 0x10) {
-                const len = this.readUInt8();
-
-                if (len >= 1) {
-                    frame.genericSwitchConfig = this.readUInt8();
+                if (frame.options & 0x80) {
+                    frame.extendedOptions = this.readUInt8();
                 }
 
-                if (len >= 2) {
-                    frame.currentContactStatus = this.readUInt8();
-                }
-            }
-
-            this.setPosition(startPosition + options.payload.payloadSize);
-
-            return frame;
-        }
-
-        if (options.payload.commandID === 0xe3) {
-            // Channel Request
-            const channelOpts = this.readUInt8();
-
-            this.setPosition(startPosition + options.payload.payloadSize);
-
-            return {
-                nextChannel: channelOpts & 0xf,
-                nextNextChannel: channelOpts >> 4,
-            };
-        }
-
-        if (options.payload.commandID === 0xa1) {
-            // Manufacturer-specific Attribute Reporting
-            const start = this.position;
-            const frame = {
-                manufacturerCode: this.readUInt16(),
-                clusterID: this.readUInt16(),
-                attributes: {} as KeyZclValue,
-            };
-
-            const cluster = Utils.getCluster(frame.clusterID, frame.manufacturerCode, {});
-
-            while (this.position - start < options.payload.payloadSize) {
-                const attributeID = this.readUInt16();
-                const type = this.readUInt8();
-                /* v8 ignore next */
-                let attribute: string | undefined | number = cluster.getAttribute(attributeID)?.name;
-
-                // number type is only used when going into this if
-                if (!attribute) {
-                    // this is spammy because of the many manufacturer-specific attributes not currently used
-                    logger.debug(`Unknown attribute ${attributeID} in cluster ${cluster.name}`, NS);
-
-                    attribute = attributeID;
+                if (frame.extendedOptions & 0x20) {
+                    frame.securityKey = this.readBuffer(16);
                 }
 
-                frame.attributes[attribute] = this.read(type, options);
+                if (frame.extendedOptions & 0x40) {
+                    frame.keyMic = this.readUInt32();
+                }
+
+                if (frame.extendedOptions & 0x80) {
+                    frame.outgoingCounter = this.readUInt32();
+                }
+
+                if (frame.options & 0x04) {
+                    frame.applicationInfo = this.readUInt8();
+                }
+
+                if (frame.applicationInfo & 0x01) {
+                    frame.manufacturerID = this.readUInt16();
+                }
+
+                if (frame.applicationInfo & 0x02) {
+                    frame.modelID = this.readUInt16();
+                }
+
+                if (frame.applicationInfo & 0x04) {
+                    frame.numGpdCommands = this.readUInt8();
+                    frame.gpdCommandIdList = this.readBuffer(frame.numGpdCommands);
+                }
+
+                if (frame.applicationInfo & 0x08) {
+                    const len = this.readUInt8();
+                    frame.numServerClusters = len & 0xf;
+                    frame.numClientClusters = (len >> 4) & 0xf;
+
+                    frame.gpdServerClusters = this.readBuffer(2 * frame.numServerClusters);
+                    frame.gpdClientClusters = this.readBuffer(2 * frame.numClientClusters);
+                }
+
+                if (frame.applicationInfo & 0x10) {
+                    const len = this.readUInt8();
+
+                    if (len >= 1) {
+                        frame.genericSwitchConfig = this.readUInt8();
+                    }
+
+                    if (len >= 2) {
+                        frame.currentContactStatus = this.readUInt8();
+                    }
+                }
+
+                this.setPosition(startPosition + options.payload.payloadSize);
+
+                return frame;
             }
+            case 0xe3: {
+                // Channel Request
+                const channelOpts = this.readUInt8();
 
-            this.setPosition(startPosition + options.payload.payloadSize);
+                this.setPosition(startPosition + options.payload.payloadSize);
 
-            return frame;
+                return {
+                    nextChannel: channelOpts & 0xf,
+                    nextNextChannel: channelOpts >> 4,
+                } satisfies GpdChannelRequest;
+            }
+            case 0xa0: {
+                // Attribute Reporting
+                const clusterID = this.readUInt16();
+                const cluster = Utils.getCluster(clusterID, undefined, {});
+                const frame: GpdAttributeReport = {
+                    clusterID,
+                    clusterName: cluster.name,
+                    attributes: {},
+                };
+
+                while (this.position - startPosition < options.payload.payloadSize) {
+                    const attributeId = this.readUInt16();
+                    const dataType = this.readUInt8();
+                    const attributeNameOrId = getClusterAttribute(cluster, attributeId, undefined)?.name ?? attributeId;
+                    frame.attributes[attributeNameOrId] = this.read(dataType, options);
+                }
+
+                this.setPosition(startPosition + options.payload.payloadSize);
+
+                return frame;
+            }
+            case 0xa1: {
+                // Manufacturer-specific Attribute Reporting
+                const manufacturerCode = this.readUInt16();
+                const clusterID = this.readUInt16();
+                const cluster = Utils.getCluster(clusterID, manufacturerCode, {});
+                const frame: GpdManufAttributeReport = {
+                    manufacturerCode,
+                    clusterID,
+                    clusterName: cluster.name,
+                    attributes: {},
+                };
+
+                while (this.position - startPosition < options.payload.payloadSize) {
+                    const attributeId = this.readUInt16();
+                    const dataType = this.readUInt8();
+                    // many times will fallback to ID since lots of unknown manu-specific attributes (handled in ZHC)
+                    const attributeNameOrId = getClusterAttribute(cluster, attributeId, manufacturerCode)?.name ?? attributeId;
+                    frame.attributes[attributeNameOrId] = this.read(dataType, options);
+                }
+
+                this.setPosition(startPosition + options.payload.payloadSize);
+
+                return frame;
+            }
+            case 0xa2: {
+                // Multi-Cluster Reporting
+                const frame: GpdMultiClusterAttributeReport = {reports: []};
+
+                while (this.position - startPosition < options.payload.payloadSize) {
+                    const clusterID = this.readUInt16();
+                    const cluster = Utils.getCluster(clusterID, undefined, {});
+                    const attributeId = this.readUInt16();
+                    const dataType = this.readUInt8();
+                    const attributeNameOrId = getClusterAttribute(cluster, attributeId, undefined)?.name ?? attributeId;
+                    const attrData = this.read(dataType, options);
+                    const report: GpdMultiClusterAttributeReport["reports"][number] = {
+                        clusterID,
+                        clusterName: cluster.name,
+                        attribute: attributeNameOrId,
+                        attrData,
+                    };
+
+                    frame.reports.push(report);
+                }
+
+                this.setPosition(startPosition + options.payload.payloadSize);
+
+                return frame;
+            }
+            case 0xa3: {
+                // Manufacturer-specific Multi-Cluster Reporting
+                const manufacturerCode = this.readUInt16();
+                const frame: GpdManufMultiClusterAttributeReport = {manufacturerCode, reports: []};
+
+                while (this.position - startPosition < options.payload.payloadSize) {
+                    const clusterID = this.readUInt16();
+                    const cluster = Utils.getCluster(clusterID, manufacturerCode, {});
+                    const attributeId = this.readUInt16();
+                    const dataType = this.readUInt8();
+                    // many times will fallback to ID since lots of unknown manu-specific attributes (handled in ZHC)
+                    const attributeNameOrId = getClusterAttribute(cluster, attributeId, manufacturerCode)?.name ?? attributeId;
+                    const attrData = this.read(dataType, options);
+                    const report: GpdManufMultiClusterAttributeReport["reports"][number] = {
+                        clusterID,
+                        clusterName: cluster.name,
+                        attribute: attributeNameOrId,
+                        attrData,
+                    };
+
+                    frame.reports.push(report);
+                }
+
+                this.setPosition(startPosition + options.payload.payloadSize);
+
+                return frame;
+            }
+            case 0xa4: {
+                // Request Attributes
+                const frame: GpdRequestAttribute = {options: this.readUInt8(), manufacturerID: undefined, records: []};
+
+                // ignore multi-record bit, while loop automatically handles it
+
+                if (frame.options & 0x02) {
+                    frame.manufacturerID = this.readUInt16();
+                }
+
+                while (this.position - startPosition < options.payload.payloadSize) {
+                    const clusterID = this.readUInt16();
+                    // payload contains size in octets
+                    const recordsLength = this.readUInt8() / 2;
+                    const attributes = this.readListUInt16(recordsLength);
+
+                    frame.records.push({clusterID, attributes});
+                }
+
+                this.setPosition(startPosition + options.payload.payloadSize);
+
+                return frame;
+            }
+            case 0xa5: {
+                // Read Attributes Response
+                const frame: GpdReadAttributeResponse = {options: this.readUInt8(), manufacturerID: undefined, records: []};
+
+                // ignore multi-record bit, while loop automatically handles it
+
+                if (frame.options & 0x02) {
+                    frame.manufacturerID = this.readUInt16();
+                }
+
+                while (this.position - startPosition < options.payload.payloadSize) {
+                    const clusterID = this.readUInt16();
+                    const cluster = Utils.getCluster(clusterID, frame.manufacturerID, {});
+                    // payload contains size in octets
+                    const recordsLength = this.readUInt8();
+                    const record: GpdReadAttributeResponse["records"][number] = {clusterID, clusterName: cluster.name, attributes: {}};
+                    let readLength = 0;
+
+                    while (readLength < recordsLength) {
+                        const startPos = this.getPosition();
+                        const attributeId = this.readUInt16();
+                        const status = this.readUInt8();
+                        const dataType = this.readUInt8();
+                        const attributeNameOrId = getClusterAttribute(cluster, attributeId, frame.manufacturerID)?.name ?? attributeId;
+                        record.attributes[attributeNameOrId] = {
+                            status,
+                            attrData: this.read(dataType, options),
+                        };
+                        readLength += this.getPosition() - startPos;
+                    }
+
+                    frame.records.push(record);
+                }
+
+                this.setPosition(startPosition + options.payload.payloadSize);
+
+                return frame;
+            }
+            default: {
+                // might contain `gppNwkAddr`, `gppGpdLink` & `mic` from ZCL cluster after this, so limit by `payloadSize`
+                return {raw: this.readBuffer(options.payload.payloadSize)};
+            }
         }
-
-        // might contain `gppNwkAddr`, `gppGpdLink` & `mic` from ZCL cluster after this, so limit by `payloadSize`
-        return {raw: this.readBuffer(options.payload.payloadSize)};
     }
 
-    private writeStructuredSelector(value: StructuredSelector): void {
+    public writeStructuredSelector(value: StructuredSelector): void {
         if (value != null) {
             const indexes = value.indexes || [];
             const indicatorType = value.indicatorType || StructuredIndicatorType.Whole;
@@ -692,7 +664,7 @@ export class BuffaloZcl extends Buffalo {
         }
     }
 
-    private readStructuredSelector(): StructuredSelector {
+    public readStructuredSelector(): StructuredSelector {
         /** [0-15] range */
         const indicator = this.readUInt8();
 
@@ -785,7 +757,7 @@ export class BuffaloZcl extends Buffalo {
         const length = this.readUInt8();
         const value: Record<number, number | number[]> = {};
 
-        if (length === 0xff) {
+        if (length === UINT8_NON_VALUE) {
             return value;
         }
 
@@ -818,7 +790,7 @@ export class BuffaloZcl extends Buffalo {
             case DataType.BITMAP8:
             case DataType.UINT8:
             case DataType.ENUM8: {
-                this.writeZclUInt8(value);
+                this.writeUInt8(value);
                 break;
             }
             case DataType.DATA16:
@@ -827,13 +799,13 @@ export class BuffaloZcl extends Buffalo {
             case DataType.ENUM16:
             case DataType.CLUSTER_ID:
             case DataType.ATTR_ID: {
-                this.writeZclUInt16(value);
+                this.writeUInt16(value);
                 break;
             }
             case DataType.DATA24:
             case DataType.BITMAP24:
             case DataType.UINT24: {
-                this.writeZclUInt24(value);
+                this.writeUInt24(value);
                 break;
             }
             case DataType.DATA32:
@@ -841,63 +813,63 @@ export class BuffaloZcl extends Buffalo {
             case DataType.UINT32:
             case DataType.UTC:
             case DataType.BAC_OID: {
-                this.writeZclUInt32(value);
+                this.writeUInt32(value);
                 break;
             }
             case DataType.DATA40:
             case DataType.BITMAP40:
             case DataType.UINT40: {
-                this.writeZclUInt40(value);
+                this.writeUInt40(value);
                 break;
             }
             case DataType.DATA48:
             case DataType.BITMAP48:
             case DataType.UINT48: {
-                this.writeZclUInt48(value);
+                this.writeUInt48(value);
                 break;
             }
             case DataType.DATA56:
             case DataType.BITMAP56:
             case DataType.UINT56: {
-                this.writeZclUInt56(value);
+                this.writeUInt56(value);
                 break;
             }
             case DataType.DATA64:
             case DataType.BITMAP64:
             case DataType.UINT64: {
-                this.writeZclUInt64(value);
+                this.writeUInt64(value);
                 break;
             }
             case DataType.INT8: {
-                this.writeZclInt8(value);
+                this.writeInt8(value);
                 break;
             }
             case DataType.INT16: {
-                this.writeZclInt16(value);
+                this.writeInt16(value);
                 break;
             }
             case DataType.INT24: {
-                this.writeZclInt24(value);
+                this.writeInt24(value);
                 break;
             }
             case DataType.INT32: {
-                this.writeZclInt32(value);
+                this.writeInt32(value);
                 break;
             }
             case DataType.INT40: {
-                this.writeZclInt40(value);
+                this.writeInt40(value);
                 break;
             }
             case DataType.INT48: {
-                this.writeZclInt48(value);
+                this.writeInt48(value);
                 break;
             }
             case DataType.INT56: {
-                this.writeZclInt56(value);
+                this.writeInt56(value);
                 break;
             }
             case DataType.INT64: {
-                this.writeZclInt64(value);
+                this.writeInt64(value);
                 break;
             }
             // case DataType.SEMI_PREC: {
@@ -1047,7 +1019,7 @@ export class BuffaloZcl extends Buffalo {
             case DataType.BITMAP8:
             case DataType.UINT8:
             case DataType.ENUM8: {
-                return this.readZclUInt8();
+                return this.readUInt8();
             }
             case DataType.DATA16:
             case DataType.BITMAP16:
@@ -1055,63 +1027,63 @@ export class BuffaloZcl extends Buffalo {
             case DataType.ENUM16:
             case DataType.CLUSTER_ID:
             case DataType.ATTR_ID: {
-                return this.readZclUInt16();
+                return this.readUInt16();
             }
             case DataType.DATA24:
             case DataType.BITMAP24:
             case DataType.UINT24: {
-                return this.readZclUInt24();
+                return this.readUInt24();
             }
             case DataType.DATA32:
             case DataType.BITMAP32:
             case DataType.UINT32:
             case DataType.UTC:
             case DataType.BAC_OID: {
-                return this.readZclUInt32();
+                return this.readUInt32();
             }
             case DataType.DATA40:
             case DataType.BITMAP40:
             case DataType.UINT40: {
-                return this.readZclUInt40();
+                return this.readUInt40();
             }
             case DataType.DATA48:
             case DataType.BITMAP48:
             case DataType.UINT48: {
-                return this.readZclUInt48();
+                return this.readUInt48();
             }
             case DataType.DATA56:
             case DataType.BITMAP56:
             case DataType.UINT56: {
-                return this.readZclUInt56();
+                return this.readUInt56();
             }
             case DataType.DATA64:
             case DataType.BITMAP64:
             case DataType.UINT64: {
-                return this.readZclUInt64();
+                return this.readUInt64();
             }
             case DataType.INT8: {
-                return this.readZclInt8();
+                return this.readInt8();
             }
             case DataType.INT16: {
-                return this.readZclInt16();
+                return this.readInt16();
             }
             case DataType.INT24: {
-                return this.readZclInt24();
+                return this.readInt24();
             }
             case DataType.INT32: {
-                return this.readZclInt32();
+                return this.readInt32();
             }
             case DataType.INT40: {
-                return this.readZclInt40();
+                return this.readInt40();
             }
             case DataType.INT48: {
-                return this.readZclInt48();
+                return this.readInt48();
             }
             case DataType.INT56: {
-                return this.readZclInt56();
+                return this.readInt56();
             }
             case DataType.INT64: {
-                return this.readZclInt64();
+                return this.readInt64();
             }
             // case DataType.SEMI_PREC: {
             //     // https://tc39.es/proposal-float16array/

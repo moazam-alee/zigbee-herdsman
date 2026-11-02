@@ -1,7 +1,6 @@
 /* v8 ignore start */
 
 import assert from "node:assert";
-
 import type * as Models from "../../../models";
 import {Queue, Waitress, wait} from "../../../utils";
 import {logger} from "../../../utils/logger";
@@ -9,44 +8,33 @@ import * as ZSpec from "../../../zspec";
 import * as Zcl from "../../../zspec/zcl";
 import * as Zdo from "../../../zspec/zdo";
 import type * as ZdoTypes from "../../../zspec/zdo/definition/tstypes";
-import Adapter from "../../adapter";
+import Adapter, {type ClusterWaitressMatcher, type ZclWaitressPayload} from "../../adapter";
 import type {ZclPayload} from "../../events";
-import type {AdapterOptions, CoordinatorVersion, NetworkOptions, NetworkParameters, SerialPortOptions, StartResult} from "../../tstype";
+import type {AdapterOptions, CoordinatorVersion, NetworkOptions, NetworkParameters, StartResult, TransportOptions} from "../../tstype";
 import {Driver, type EmberIncomingMessage} from "../driver";
 import {EmberEUI64, EmberStatus} from "../driver/types";
 
 const NS = "zh:ezsp";
 
-interface WaitressMatcher {
-    address?: number | string;
-    endpoint: number;
-    transactionSequenceNumber?: number;
-    clusterID: number;
-    commandIdentifier: number;
-}
-
 export class EZSPAdapter extends Adapter {
     private driver: Driver;
-    private waitress: Waitress<ZclPayload, WaitressMatcher>;
+    private waitress: Waitress<ZclWaitressPayload, ClusterWaitressMatcher>;
     private interpanLock: boolean;
     private queue: Queue;
-    private closing: boolean;
 
-    public constructor(networkOptions: NetworkOptions, serialPortOptions: SerialPortOptions, backupPath: string, adapterOptions: AdapterOptions) {
-        super(networkOptions, serialPortOptions, backupPath, adapterOptions);
+    public constructor(networkOptions: NetworkOptions, transportOptions: TransportOptions, backupPath: string, adapterOptions: AdapterOptions) {
+        super(networkOptions, transportOptions, backupPath, adapterOptions);
         this.hasZdoMessageOverhead = true;
         this.manufacturerID = Zcl.ManufacturerCode.SILICON_LABORATORIES;
 
-        this.waitress = new Waitress<ZclPayload, WaitressMatcher>(this.waitressValidator, this.waitressTimeoutFormatter);
+        this.waitress = new Waitress(Adapter.zclWaitressValidator, Adapter.clusterWaitressTimeoutFormatter);
         this.interpanLock = false;
-        this.closing = false;
 
         const concurrent = adapterOptions?.concurrent ? adapterOptions.concurrent : 8;
         logger.debug(`Adapter concurrent: ${concurrent}`, NS);
         this.queue = new Queue(concurrent);
 
-        this.driver = new Driver(this.serialPortOptions, this.networkOptions, backupPath);
-        this.driver.on("close", this.onDriverClose.bind(this));
+        this.driver = new Driver(this.transport, this.networkOptions, backupPath);
         this.driver.on("deviceJoined", this.handleDeviceJoin.bind(this));
         this.driver.on("deviceLeft", this.handleDeviceLeft.bind(this));
         this.driver.on("incomingMessage", this.processMessage.bind(this));
@@ -64,7 +52,9 @@ export class EZSPAdapter extends Adapter {
             frame.apsFrame.profileId === ZSpec.HA_PROFILE_ID ||
             frame.apsFrame.profileId === 0xffff ||
             // Shelly custom Clusters require a special profile ID
-            frame.apsFrame.profileId === ZSpec.CUSTOM_SHELLY_PROFILE_ID
+            frame.apsFrame.profileId === ZSpec.CUSTOM_SHELLY_PROFILE_ID ||
+            // Control4 custom Clusters require a special profile ID
+            frame.apsFrame.profileId === ZSpec.CUSTOM_CONTROL4_PROFILE_ID
         ) {
             const payload: ZclPayload = {
                 clusterID: frame.apsFrame.clusterId,
@@ -78,7 +68,10 @@ export class EZSPAdapter extends Adapter {
                 destinationEndpoint: frame.apsFrame.destinationEndpoint,
             };
 
-            this.waitress.resolve(payload);
+            if (payload.header !== undefined) {
+                this.waitress.resolve(payload as ZclWaitressPayload);
+            }
+
             this.emit("zclPayload", payload);
         } else if (frame.apsFrame.profileId === ZSpec.TOUCHLINK_PROFILE_ID && frame.senderEui64) {
             // ZLL Frame
@@ -94,7 +87,10 @@ export class EZSPAdapter extends Adapter {
                 destinationEndpoint: 1,
             };
 
-            this.waitress.resolve(payload);
+            if (payload.header !== undefined) {
+                this.waitress.resolve(payload as ZclWaitressPayload);
+            }
+
             this.emit("zclPayload", payload);
         } else if (frame.apsFrame.profileId === ZSpec.GP_PROFILE_ID) {
             // GP Frame
@@ -114,7 +110,10 @@ export class EZSPAdapter extends Adapter {
                     destinationEndpoint: frame.apsFrame.sourceEndpoint,
                 };
 
-                this.waitress.resolve(payload);
+                if (payload.header !== undefined) {
+                    this.waitress.resolve(payload as ZclWaitressPayload);
+                }
+
                 this.emit("zclPayload", payload);
             } else {
                 logger.debug("Ignoring GP frame because clusterId is not greenPower", NS);
@@ -152,16 +151,7 @@ export class EZSPAdapter extends Adapter {
     }
 
     public async stop(): Promise<void> {
-        this.closing = true;
         await this.driver.stop();
-    }
-
-    public onDriverClose(): void {
-        logger.debug("onDriverClose()", NS);
-
-        if (!this.closing) {
-            this.emit("disconnected");
-        }
     }
 
     public async getCoordinatorIEEE(): Promise<string> {
@@ -373,6 +363,7 @@ export class EZSPAdapter extends Adapter {
                 zclFrame.header.transactionSequenceNumber,
                 zclFrame.cluster.ID,
                 command.response,
+                undefined,
                 timeout,
             );
         } else if (!zclFrame.header.frameControl.disableDefaultResponse) {
@@ -382,6 +373,7 @@ export class EZSPAdapter extends Adapter {
                 zclFrame.header.transactionSequenceNumber,
                 zclFrame.cluster.ID,
                 Zcl.Foundation.defaultRsp.ID,
+                undefined,
                 timeout,
             );
         }
@@ -526,16 +518,22 @@ export class EZSPAdapter extends Adapter {
         });
     }
 
-    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number): Promise<ZclPayload> {
-        return await this.queue.execute<ZclPayload>(async () => {
+    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number, disableResponse: false): Promise<ZclPayload>;
+    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number, disableResponse: true): Promise<undefined>;
+    public async sendZclFrameInterPANBroadcast(zclFrame: Zcl.Frame, timeout: number, disableResponse: boolean): Promise<ZclPayload | undefined> {
+        return await this.queue.execute<ZclPayload | undefined>(async () => {
             logger.debug("sendZclFrameInterPANBroadcast", NS);
             const command = zclFrame.command;
 
-            if (command.response === undefined) {
+            if (!disableResponse && command.response === undefined) {
                 throw new Error(`Command '${command.name}' has no response, cannot wait for response`);
             }
 
-            const response = this.waitForInternal(undefined, 0xfe, undefined, zclFrame.cluster.ID, command.response, timeout);
+            let response: ReturnType<typeof this.waitForInternal> | undefined;
+
+            if (!disableResponse && command.response !== undefined) {
+                this.waitForInternal(undefined, 0xfe, undefined, zclFrame.cluster.ID, command.response, undefined, timeout);
+            }
 
             try {
                 const frame = this.driver.makeEmberRawFrame();
@@ -551,11 +549,13 @@ export class EZSPAdapter extends Adapter {
 
                 await this.driver.rawrequest(frame, zclFrame.toBuffer());
             } catch (error) {
-                response.cancel();
+                response?.cancel();
                 throw error;
             }
 
-            return await response.start().promise;
+            if (response) {
+                return await response.start().promise;
+            }
         });
     }
 
@@ -570,18 +570,13 @@ export class EZSPAdapter extends Adapter {
         networkAddress: number | undefined,
         endpoint: number,
         transactionSequenceNumber: number | undefined,
-        clusterID: number,
-        commandIdentifier: number,
+        clusterId: number,
+        commandId: number,
+        defaultRspCommandId: number | undefined,
         timeout: number,
     ): {start: () => {promise: Promise<ZclPayload>}; cancel: () => void} {
         const waiter = this.waitress.waitFor(
-            {
-                address: networkAddress,
-                endpoint,
-                clusterID,
-                commandIdentifier,
-                transactionSequenceNumber,
-            },
+            {address: networkAddress, endpoint, clusterId, commandId, defaultRspCommandId, transactionSequenceNumber},
             timeout,
         );
         const cancel = (): void => this.waitress.remove(waiter.ID);
@@ -589,36 +584,18 @@ export class EZSPAdapter extends Adapter {
     }
 
     public waitFor(
-        networkAddress: number | undefined,
+        networkAddress: number,
         endpoint: number,
         _frameType: Zcl.FrameType,
         _direction: Zcl.Direction,
         transactionSequenceNumber: number | undefined,
-        clusterID: number,
-        commandIdentifier: number,
+        clusterId: number,
+        commandId: number,
+        defaultRspCommandId: number | undefined,
         timeout: number,
     ): {promise: Promise<ZclPayload>; cancel: () => void} {
-        const waiter = this.waitForInternal(networkAddress, endpoint, transactionSequenceNumber, clusterID, commandIdentifier, timeout);
+        const waiter = this.waitForInternal(networkAddress, endpoint, transactionSequenceNumber, clusterId, commandId, defaultRspCommandId, timeout);
 
         return {cancel: waiter.cancel, promise: waiter.start().promise};
-    }
-
-    private waitressTimeoutFormatter(matcher: WaitressMatcher, timeout: number): string {
-        return (
-            `Timeout - ${matcher.address} - ${matcher.endpoint}` +
-            ` - ${matcher.transactionSequenceNumber} - ${matcher.clusterID}` +
-            ` - ${matcher.commandIdentifier} after ${timeout}ms`
-        );
-    }
-
-    private waitressValidator(payload: ZclPayload, matcher: WaitressMatcher): boolean {
-        return Boolean(
-            payload.header &&
-                (!matcher.address || payload.address === matcher.address) &&
-                payload.endpoint === matcher.endpoint &&
-                (matcher.transactionSequenceNumber === undefined || payload.header.transactionSequenceNumber === matcher.transactionSequenceNumber) &&
-                payload.clusterID === matcher.clusterID &&
-                matcher.commandIdentifier === payload.header.commandIdentifier,
-        );
     }
 }

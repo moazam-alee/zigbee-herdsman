@@ -1,8 +1,8 @@
 import assert from "node:assert";
 import events from "node:events";
 import fs from "node:fs";
-import mixinDeep from "mixin-deep";
 import {Adapter, type Events as AdapterEvents, type TsType as AdapterTsType} from "../adapter";
+import type {ZclPayload} from "../adapter/events";
 import {BackupUtils, wait} from "../utils";
 import {logger} from "../utils/logger";
 import {isNumberArrayOfLength} from "../utils/utils";
@@ -10,7 +10,8 @@ import * as ZSpec from "../zspec";
 import type {Eui64} from "../zspec/tstypes";
 import * as Zcl from "../zspec/zcl";
 import type {TPartialClusterAttributes} from "../zspec/zcl/definition/clusters-types";
-import type {FrameControl} from "../zspec/zcl/definition/tstype";
+import type {CustomClusters, FrameControl} from "../zspec/zcl/definition/tstype";
+import {ZclStatusError} from "../zspec/zcl/zclStatusError";
 import * as Zdo from "../zspec/zdo";
 import type * as ZdoTypes from "../zspec/zdo/definition/tstypes";
 import Database from "./database";
@@ -18,17 +19,18 @@ import type * as Events from "./events";
 import GreenPower from "./greenPower";
 import {ZclFrameConverter} from "./helpers";
 import {checkInstallCode, parseInstallCode} from "./helpers/installCodes";
+import zclTransactionSequenceNumber from "./helpers/zclTransactionSequenceNumber";
 import {Device, Entity} from "./model";
 import {InterviewState} from "./model/device";
 import Group from "./model/group";
 import Touchlink from "./touchlink";
-import type {DeviceType, GreenPowerDeviceJoinedPayload} from "./tstype";
+import type {DeviceType, GreenPowerDeviceJoinedPayload, RawPayload} from "./tstype";
 
 const NS = "zh:controller";
 
 interface Options {
     network: AdapterTsType.NetworkOptions;
-    serialPort: AdapterTsType.SerialPortOptions;
+    transport: AdapterTsType.TransportOptions;
     databasePath: string;
     databaseBackupPath: string;
     backupPath: string;
@@ -40,18 +42,6 @@ interface Options {
      */
     acceptJoiningDeviceHandler: (ieeeAddr: string) => Promise<boolean>;
 }
-
-const DefaultOptions: Pick<Options, "network" | "serialPort" | "adapter"> = {
-    network: {
-        networkKeyDistribute: false,
-        networkKey: [0x01, 0x03, 0x05, 0x07, 0x09, 0x0b, 0x0d, 0x0f, 0x00, 0x02, 0x04, 0x06, 0x08, 0x0a, 0x0c, 0x0d],
-        panID: 0x1a62,
-        extendedPanID: [0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd],
-        channelList: [11],
-    },
-    serialPort: {},
-    adapter: {disableLED: false},
-};
 
 export interface ControllerEventMap {
     message: [data: Events.MessagePayload];
@@ -72,8 +62,8 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
     private options: Options;
     private database!: Database;
     private adapter!: Adapter;
-    private greenPower!: GreenPower;
-    private touchlink!: Touchlink;
+    #greenPower!: GreenPower;
+    #touchlink!: Touchlink;
 
     private permitJoinTimer: NodeJS.Timeout | undefined;
     private permitJoinEnd?: number;
@@ -94,7 +84,20 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
         super();
         this.stopping = false;
         this.adapterDisconnected = true; // set false after adapter.start() is successfully called
-        this.options = mixinDeep(JSON.parse(JSON.stringify(DefaultOptions)), options);
+        const {network: networkOpts, transport: transportOpts, adapter: adapterOpts, ...restOpts} = options;
+        this.options = {
+            network: {
+                networkKeyDistribute: false,
+                networkKey: [0x01, 0x03, 0x05, 0x07, 0x09, 0x0b, 0x0d, 0x0f, 0x00, 0x02, 0x04, 0x06, 0x08, 0x0a, 0x0c, 0x0d],
+                extendedPanID: [0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd, 0xdd],
+                ...networkOpts,
+            },
+            transport: {...transportOpts},
+            adapter: {
+                ...adapterOpts,
+            },
+            ...restOpts,
+        };
         this.unknownDevices = new Set();
 
         // Validate options
@@ -117,22 +120,36 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
         }
     }
 
+    get greenPower() {
+        return this.#greenPower;
+    }
+
+    get touchlink() {
+        return this.#touchlink;
+    }
+
     /**
      * Start the Herdsman controller
      */
-    public async start(): Promise<AdapterTsType.StartResult> {
+    public async start(abortSignal?: AbortSignal): Promise<AdapterTsType.StartResult> {
         // Database (create end inject)
         this.database = Database.open(this.options.databasePath);
         Entity.injectDatabase(this.database);
 
         // Adapter (create and inject)
-        this.adapter = await Adapter.create(this.options.network, this.options.serialPort, this.options.backupPath, this.options.adapter);
+        this.adapter = await Adapter.create(this.options.network, this.options.transport, this.options.backupPath, this.options.adapter);
+
+        abortSignal?.throwIfAborted();
 
         const stringifiedOptions = JSON.stringify(this.options).replaceAll(JSON.stringify(this.options.network.networkKey), '"HIDDEN"');
         logger.debug(`Starting with options '${stringifiedOptions}'`, NS);
         const startResult = await this.adapter.start();
         logger.debug(`Started with result '${startResult}'`, NS);
         this.adapterDisconnected = false;
+
+        abortSignal?.throwIfAborted();
+        // register early to always handle transport issues immediately after `start`
+        this.adapter.on("disconnected", this.onAdapterDisconnected.bind(this));
 
         // Check if we have to change the channel, only do this when adapter `resumed` because:
         // - `getNetworkParameters` might be return wrong info because it needs to propogate after backup restore
@@ -146,6 +163,8 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
             if (configuredChannel !== adapterChannel) {
                 logger.info(`Configured channel '${configuredChannel}' does not match adapter channel '${adapterChannel}', changing channel`, NS);
                 await this.changeChannel(adapterChannel, configuredChannel, nwkUpdateID);
+
+                abortSignal?.throwIfAborted();
             }
         }
 
@@ -154,15 +173,14 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
         // log injection
         logger.debug(`Injected database: ${this.database !== undefined}, adapter: ${this.adapter !== undefined}`, NS);
 
-        this.greenPower = new GreenPower(this.adapter);
-        this.greenPower.on("deviceJoined", this.onDeviceJoinedGreenPower.bind(this));
-        this.greenPower.on("deviceLeave", this.onDeviceLeaveGreenPower.bind(this));
+        this.#greenPower = new GreenPower(this.adapter);
+        this.#greenPower.on("deviceJoined", this.onDeviceJoinedGreenPower.bind(this));
+        this.#greenPower.on("deviceLeave", this.onDeviceLeaveGreenPower.bind(this));
 
         // Register adapter events
         this.adapter.on("deviceJoined", this.onDeviceJoined.bind(this));
         this.adapter.on("zclPayload", this.onZclPayload.bind(this));
         this.adapter.on("zdoResponse", this.onZdoResponse.bind(this));
-        this.adapter.on("disconnected", this.onAdapterDisconnected.bind(this));
         this.adapter.on("deviceLeave", this.onDeviceLeave.bind(this));
 
         if (startResult === "reset") {
@@ -170,19 +188,17 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
                 fs.copyFileSync(this.options.databasePath, this.options.databaseBackupPath);
             }
 
-            logger.debug("Clearing database...", NS);
-            for (const group of Group.allIterator()) {
-                group.removeFromDatabase();
-            }
-
-            for (const device of Device.allIterator()) {
-                device.removeFromDatabase();
-            }
+            this.database.clear();
+            Group.resetCache();
             Device.resetCache();
+
+            abortSignal?.throwIfAborted();
         }
 
         if (startResult === "reset" || (this.options.backupPath && !fs.existsSync(this.options.backupPath))) {
             await this.backup();
+
+            abortSignal?.throwIfAborted();
         }
 
         // Add coordinator to the database if it is not there yet.
@@ -204,8 +220,12 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
 
             await coordinator.updateActiveEndpoints();
 
+            abortSignal?.throwIfAborted();
+
             for (const endpoint of coordinator.endpoints) {
                 await endpoint.updateSimpleDescriptor();
+
+                abortSignal?.throwIfAborted();
             }
 
             coordinator.save();
@@ -219,30 +239,124 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
         }
 
         // Set backup timer to 1 day.
-        this.backupTimer = setInterval(() => this.backup(), 86400000);
+        this.backupTimer = setInterval(() => this.backup().catch((err) => logger.error(`Failed to backup: ${err}`, NS)), 86400000);
 
-        // Set database save timer to 1 hour.
-        this.databaseSaveTimer = setInterval(() => this.databaseSave(), 3600000);
+        // Set database save timer to 5 minutes.
+        this.databaseSaveTimer = setInterval(() => this.databaseSave(), 300000);
 
-        this.touchlink = new Touchlink(this.adapter);
+        this.#touchlink = new Touchlink(this.adapter);
 
         return startResult;
     }
 
-    public async touchlinkIdentify(ieeeAddr: string, channel: number): Promise<void> {
-        await this.touchlink.identify(ieeeAddr, channel);
-    }
+    /**
+     * Send a request according to given payload.
+     * @param rawPayload Payload used to determine and build the request
+     * @param customClusters Manually passed custom clusters used in ZCL serialization (if any, if matching)
+     * @returns A response may or may not be returned depending on given payload (up to caller to verify)
+     */
+    public async sendRaw(rawPayload: RawPayload, customClusters: CustomClusters = {}): Promise<ZdoTypes.GenericZdoResponse | ZclPayload | undefined> {
+        const {
+            ieeeAddress,
+            networkAddress,
+            groupId,
+            dstEndpoint,
+            srcEndpoint = ZSpec.HA_ENDPOINT,
+            interPan = false,
+            profileId = ZSpec.HA_PROFILE_ID,
+            clusterKey,
+            zdoParams,
+            zcl,
+            disableResponse = false,
+            timeout = 10000,
+        } = rawPayload;
 
-    public async touchlinkScan(): Promise<{ieeeAddr: string; channel: number}[]> {
-        return await this.touchlink.scan();
-    }
+        if (profileId === Zdo.ZDO_PROFILE_ID) {
+            assert(ieeeAddress);
+            assert(networkAddress !== undefined);
+            assert(clusterKey !== undefined && typeof clusterKey === "number");
+            // no ZDO request takes 0 params
+            assert(Array.isArray(zdoParams) && zdoParams.length > 0);
 
-    public async touchlinkFactoryReset(ieeeAddr: string, channel: number): Promise<boolean> {
-        return await this.touchlink.factoryReset(ieeeAddr, channel);
-    }
+            // will fail if args are incorrect for request
+            const buf = Zdo.Buffalo.buildRequest(this.adapter.hasZdoMessageOverhead, clusterKey, ...zdoParams);
 
-    public async touchlinkFactoryResetFirst(): Promise<boolean> {
-        return await this.touchlink.factoryResetFirst();
+            return (await this.adapter.sendZdo(ieeeAddress, networkAddress, clusterKey, buf, disableResponse)) as ZdoTypes.GenericZdoResponse;
+        }
+
+        assert(zcl);
+
+        if (interPan) {
+            assert(zcl.commandKey);
+            assert(zcl.payload);
+            assert(zcl.frameType === undefined);
+            assert(zcl.direction === undefined);
+
+            const zclFrame = Zcl.Frame.create(
+                zcl.frameType ?? Zcl.FrameType.SPECIFIC,
+                zcl.direction ?? Zcl.Direction.CLIENT_TO_SERVER,
+                true,
+                zcl.manufacturerCode,
+                0,
+                zcl.commandKey,
+                clusterKey ?? "touchlink",
+                zcl.payload,
+                customClusters,
+            );
+
+            if (ieeeAddress) {
+                await this.adapter.sendZclFrameInterPANToIeeeAddr(zclFrame, ieeeAddress);
+                return;
+            }
+
+            return await this.adapter.sendZclFrameInterPANBroadcast(zclFrame, timeout, disableResponse);
+        }
+
+        assert(clusterKey !== undefined);
+        assert(zcl.frameType !== undefined);
+        assert(zcl.direction !== undefined);
+
+        const zclFrame = Zcl.Frame.create(
+            zcl.frameType,
+            zcl.direction,
+            zcl.disableDefaultResponse ?? false,
+            zcl.manufacturerCode,
+            zcl.tsn ?? zclTransactionSequenceNumber.next(),
+            zcl.commandKey,
+            clusterKey,
+            zcl.payload,
+            customClusters,
+        );
+
+        if (groupId !== undefined) {
+            assert(groupId >= 0x0000 && groupId <= 0xffff);
+
+            await this.adapter.sendZclFrameToGroup(groupId, zclFrame, srcEndpoint, profileId);
+            return;
+        }
+
+        assert(dstEndpoint !== undefined && dstEndpoint >= 0x01 && dstEndpoint <= 0xff);
+        assert(srcEndpoint >= 0x01 && srcEndpoint <= 0xff);
+        assert(networkAddress !== undefined && networkAddress >= 0x0000 && networkAddress <= 0xffff);
+
+        if (networkAddress >= ZSpec.BROADCAST_MIN) {
+            await this.adapter.sendZclFrameToAll(dstEndpoint, zclFrame, srcEndpoint, networkAddress, profileId);
+            return;
+        }
+
+        assert(ieeeAddress);
+
+        return await this.adapter.sendZclFrameToEndpoint(
+            ieeeAddress,
+            networkAddress,
+            dstEndpoint,
+            zclFrame,
+            timeout,
+            disableResponse,
+            false,
+            srcEndpoint,
+            profileId,
+        );
     }
 
     public async addInstallCode(installCode: string): Promise<void> {
@@ -278,7 +392,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
             assert(time <= 254, "Cannot permit join for more than 254 seconds.");
 
             await this.adapter.permitJoin(time, device?.networkAddress);
-            await this.greenPower.permitJoin(time, device?.networkAddress);
+            await this.#greenPower.permitJoin(time, device?.networkAddress);
 
             const timeMs = time * 1000;
             this.permitJoinEnd = Date.now() + timeMs;
@@ -293,7 +407,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
         } else {
             logger.debug("Disable joining", NS);
 
-            await this.greenPower.permitJoin(0);
+            await this.#greenPower.permitJoin(0);
             await this.adapter.permitJoin(0);
 
             this.emit("permitJoinChanged", {permitted: false});
@@ -328,6 +442,12 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
         if (this.adapterDisconnected) {
             this.databaseSave();
         } else {
+            try {
+                await this.#touchlink.stop();
+            } catch (error) {
+                logger.error(`Failed to stop Touchlink: ${error}`, NS);
+            }
+
             try {
                 await this.permitJoin(0);
             } catch (error) {
@@ -600,6 +720,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
         this.selfAndDeviceEmit(device, "lastSeenChanged", {device, reason: "deviceAnnounce"});
         device.implicitCheckin();
         this.checkDeviceNetworkAddress(device, payload.eui64, payload.nwkAddress);
+        device.resetTransient(false);
         this.selfAndDeviceEmit(device, "deviceAnnounce", {device});
     }
 
@@ -746,10 +867,13 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
                 InterviewState.Pending,
                 undefined,
             );
+
+            device.resetTransient(true);
             this.selfAndDeviceEmit(device, "deviceJoined", {device});
         } else if (device.isDeleted) {
             logger.debug(`Deleted device '${payload.ieeeAddr}' joined, undeleting`, NS);
             device.undelete();
+            device.resetTransient(true);
             this.selfAndDeviceEmit(device, "deviceJoined", {device});
         }
 
@@ -813,6 +937,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
     private async onZclPayload(payload: AdapterEvents.ZclPayload): Promise<void> {
         let frame: Zcl.Frame | undefined;
         let device: Device | undefined;
+        let defaultResponse: Zcl.Status | undefined;
 
         if (payload.clusterID === Zcl.Clusters.touchlink.ID) {
             // This is handled by touchlink
@@ -843,7 +968,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
 
                 const ieeeAddr = GreenPower.sourceIdToIeeeAddress(frame.payload.srcID);
                 device = Device.byIeeeAddr(ieeeAddr);
-                frame = await this.greenPower.processCommand(payload, frame, device?.gpSecurityKey ? Buffer.from(device.gpSecurityKey) : undefined);
+                frame = await this.#greenPower.processCommand(payload, frame, device?.gpSecurityKey ? Buffer.from(device.gpSecurityKey) : undefined);
 
                 // lookup encapsulated gpDevice for further processing (re-fetch, may have been created by above call)
                 device = Device.byIeeeAddr(ieeeAddr);
@@ -877,11 +1002,15 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
                 frame = Zcl.Frame.fromBuffer(payload.clusterID, payload.header, payload.data, device ? device.customClusters : {});
             } catch (error) {
                 logger.debug(`Failed to parse frame: ${error}`, NS);
+
+                if (error instanceof ZclStatusError) {
+                    defaultResponse = error.code;
+                }
             }
         }
 
         if (!device) {
-            if (typeof payload.address === "number") {
+            if (typeof payload.address === "number" && !Device.isDeletedByNetworkAddress(payload.address)) {
                 device = await this.identifyUnknownDevice(payload.address);
             }
 
@@ -901,7 +1030,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
         device.updateLastSeen();
 
         //no implicit checkin for genPollCtrl data because it might interfere with the explicit checkin
-        if (!frame?.isCluster("genPollCtrl")) {
+        if (frame?.cluster.name !== "genPollCtrl") {
             device.implicitCheckin();
         }
 
@@ -975,7 +1104,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
 
                 if (type === "readResponse" || type === "attributeReport") {
                     // devices report attributes through readRsp or attributeReport
-                    if (frame.isCluster("genBasic")) {
+                    if (frame.cluster.name === "genBasic") {
                         device.updateGenBasic(data as TPartialClusterAttributes<"genBasic">);
                     }
 
@@ -1013,9 +1142,7 @@ export class Controller extends events.EventEmitter<ControllerEventMap> {
             this.selfAndDeviceEmit(device, "lastSeenChanged", {device, reason: "messageNonEmitted"});
         }
 
-        if (frame) {
-            await device.onZclData(payload, frame, endpoint);
-        }
+        await device.onZclData(payload, frame, endpoint, defaultResponse);
     }
 }
 

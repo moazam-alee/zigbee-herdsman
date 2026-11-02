@@ -1,4 +1,5 @@
-import type {BuffaloZclDataType, DataType, DataTypeClass, Direction, FrameType, ParameterCondition, StructuredIndicatorType} from "./enums";
+import type {BuffaloZclDataType, DataType, Direction, FrameType, ParameterCondition, StructuredIndicatorType} from "./enums";
+import type {Status} from "./status";
 
 export interface BuffaloZclOptions {
     length?: number;
@@ -20,10 +21,6 @@ export interface ZclArray {
 export interface StructuredSelector {
     indexes?: number[];
     indicatorType?: StructuredIndicatorType;
-}
-
-export interface KeyZclValue {
-    [s: string | number]: number | string;
 }
 
 export interface Struct {
@@ -119,11 +116,46 @@ export interface GpdCustomReply {
     buffer: Buffer;
 }
 
-export interface GpdAttributeReport {
-    manufacturerCode: number;
+export type GpdAttributeReport = {
     clusterID: number;
-    attributes: KeyZclValue;
-}
+    clusterName: string;
+    attributes: Record<string | number, unknown>;
+};
+
+export type GpdManufAttributeReport = {
+    manufacturerCode: number;
+} & GpdAttributeReport;
+
+export type GpdMultiClusterAttributeReport = {
+    reports: Array<{
+        clusterID: number;
+        clusterName: string;
+        attribute: string | number;
+        attrData: unknown;
+    }>;
+};
+
+export type GpdManufMultiClusterAttributeReport = {
+    manufacturerCode: number;
+} & GpdMultiClusterAttributeReport;
+
+export type GpdAttributeReporting =
+    | GpdAttributeReport
+    | GpdManufAttributeReport
+    | GpdMultiClusterAttributeReport
+    | GpdManufMultiClusterAttributeReport;
+
+export type GpdRequestAttribute = {
+    options: number;
+    manufacturerID: number | undefined;
+    records: Array<{clusterID: number; attributes: Array<number>}>;
+};
+
+export type GpdReadAttributeResponse = {
+    options: number;
+    manufacturerID: number | undefined;
+    records: Array<{clusterID: number; clusterName: string; attributes: Record<string | number, {status: Status; attrData: unknown}>}>;
+};
 
 export interface TuyaDataPointValue {
     dp: number;
@@ -144,74 +176,131 @@ export interface FrameControl {
     disableDefaultResponse: boolean;
 }
 
-export interface Attribute {
+/**
+ * @see https://github.com/project-chip/zap/blob/master/zcl-builtin/dotdot/README.md#restrictions
+ */
+type Restrictions = Readonly<{
+    /** specifies an exact length, generally used for a string. */
+    length?: number;
+    /** specifies the minimum length that a type must take, generally used for a string or a list/array */
+    minLen?: number;
+    /** specifies the maximum length that a type must take, generally used for a string or a list/array */
+    maxLen?: number;
+    /** sets a minimum that doesn't include the value specified, i.e. a field of this type must be strictly greater than the value */
+    minExcl?: number;
+    /** sets a minimum that includes the value specified, i.e. a field of this type must be greater than or equal than the value */
+    min?: number;
+    /** sets a maximum that doesn't include the value specified, i.e. a field of this type must be strictly less than the value */
+    maxExcl?: number;
+    /** sets a maximum that includes the value specified, i.e. a field of this type must be less than or equal to the value */
+    max?: number;
+    /** sets a minimum that is based on the value of the referenced attribute. The value of the referenced attribute is included in the range */
+    // minRef?: string;
+    /** sets a minimum that is based on the value of the referenced attribute. The value of the referenced attribute is excluded from the range */
+    // minExclRef?: string;
+    /** sets a maximum that is based on the value of the referenced attribute. The value of the referenced attribute is included in the range */
+    // maxRef?: string;
+    /** sets a maximum that is based on the value of the referenced attribute. The value of the referenced attribute is excluded from the range */
+    // maxExclRef?: string;
+    /**
+     * In some cases, a special value is defined by the Zigbee specification.
+     * In these cases, the special value along with a descriptor should be defined using this tag.
+     * Special values take precedence over other restrictions imposed (e.g. a special value may fall outside the min/max range for the attribute).
+     *
+     * Mapped as "value -> label".
+     * Technically `1 in ..` and `"1" in ..` will match, but for same entry, value is always expected of same type, so does not matter.
+     */
+    special?: Record<string | number, string>;
+}>;
+
+/**
+ * @see https://github.com/project-chip/zap/blob/master/zcl-builtin/dotdot/README.md#attributes
+ * Extra metadata:
+ * - writableIf: Indicates an expression that specifies the writability of the attribute.
+ *               Defaults to true.
+ *               Note: An attribute is only writable if this attribute and the writable attribute are true.
+ * - requiredIf: Allows for an expression to be implemented which indicates the conditions in which an attribute is mandatory.
+ *               Defaults to false
+ */
+export type Attribute = Readonly<{
     ID: number;
     name: string;
     type: DataType;
     manufacturerCode?: number;
-}
+    /** If the attribute is readable OTA. Defaults to true. NOTE: marked as `R` in spec PDF */
+    read?: false;
+    /** If the attribute is writable OTA. Defaults to false. NOTE: marked as `W` in spec PDF */
+    write?: true;
+    /** If the attribute is specified as writable this indicates if the write is required (returns READ_ONLY if not). Defaults to false. */
+    writeOptional?: true;
+    /** If attribute is required to be reportable. Defaults to false. NOTE: marked as `P` in spec PDF */
+    report?: true;
+    /** If attribute is required to be part of the scene extensions. Defaults to false. NOTE: marked as `S` in spec PDF */
+    scene?: true;
+    /** If the attribute is mandatory. Defaults to false */
+    required?: true;
+    /** Specifies the default value of an attribute. No Default */
+    default?: number | string;
+    /**
+     * Specifies that the default value of the attribute takes the value of the referenced attribute.
+     * Must be another attriibute in this cluster.
+     * Referenced by name, schema forces this during validation.
+     */
+    // defaultRef?: string;
+    /** If attribute is client side */
+    client?: true;
+}> &
+    Restrictions;
 
-export interface Parameter {
+export type Parameter = Readonly<{
     name: string;
     type: DataType | BuffaloZclDataType;
-}
+    conditions?: readonly (
+        | {type: ParameterCondition.MINIMUM_REMAINING_BUFFER_BYTES; value: number}
+        | {type: ParameterCondition.BITMASK_SET; param: string; mask: number /* not set */; reversed?: boolean}
+        | {type: ParameterCondition.BITFIELD_ENUM; param: string; offset: number; size: number; value: number}
+        | {type: ParameterCondition.FIELD_EQUAL; field: string; value: unknown; reversed?: boolean}
+        | {type: ParameterCondition.FIELD_GT; field: string; value: number /*; reversed?: boolean*/}
+    )[];
+    // XXX: current have no use for neither of below
+    /**
+     * When an array is present, specifies the size (in octets) of the field that specifies the array length.
+     * Defaults to 1.
+     */
+    // arrayLengthSize?: number;
+    /**
+     * When the number of elements in an array field is specified by another field which does not immediately precede an array field,
+     * that field may be referenced using this attribute.
+     */
+    // arrayLengthField?: string;
+}> &
+    Restrictions;
 
-export interface Command {
+/**
+ * @see https://github.com/project-chip/zap/blob/master/zcl-builtin/dotdot/README.md#commands
+ * Extra metadata:
+ * - requiredIf: Allows for an expression to be implemented which indicates the conditions in which a command is mandatory. Defaults to false
+ */
+export type Command = Readonly<{
     ID: number;
     name: string;
     parameters: readonly Parameter[];
     response?: number;
-}
+    /** If the command is mandatory. Defaults to false */
+    required?: true;
+}>;
 
-export interface AttributeDefinition {
-    ID: number;
-    type: DataType;
-    manufacturerCode?: number;
-}
-
-export interface ParameterDefinition extends Parameter {
-    conditions?: (
-        | {type: ParameterCondition.MINIMUM_REMAINING_BUFFER_BYTES; value: number}
-        | {type: ParameterCondition.BITMASK_SET; param: string; mask: number /* not set */; reversed?: boolean}
-        | {type: ParameterCondition.BITFIELD_ENUM; param: string; offset: number; size: number; value: number}
-        | {type: ParameterCondition.DATA_TYPE_CLASS_EQUAL; value: DataTypeClass}
-        | {type: ParameterCondition.FIELD_EQUAL; field: string; value: unknown; reversed?: boolean}
-        | {type: ParameterCondition.FIELD_GT; field: string; value: number /*; reversed?: boolean*/}
-    )[];
-}
-
-export interface CommandDefinition {
-    ID: number;
-    parameters: readonly ParameterDefinition[];
-    response?: number;
-}
-
-export interface Cluster {
+export type Cluster = Readonly<{
     ID: number;
     name: string;
     manufacturerCode?: number;
-    attributes: {[s: string]: Attribute};
-    commands: {
-        [s: string]: Command;
-    };
-    commandsResponse: {
-        [s: string]: Command;
-    };
-    getAttribute: (key: number | string) => Attribute | undefined;
-    getCommand: (key: number | string) => Command;
-    getCommandResponse: (key: number | string) => Command;
-}
-
-export interface ClusterDefinition {
-    ID: number;
-    manufacturerCode?: number;
-    attributes: Readonly<Record<string, Readonly<AttributeDefinition>>>;
-    commands: Readonly<Record<string, Readonly<CommandDefinition>>>;
-    commandsResponse: Readonly<Record<string, Readonly<CommandDefinition>>>;
-}
+    attributes: Readonly<Record<string, Attribute>>;
+    commands: Readonly<Record<string, Command>>;
+    commandsResponse: Readonly<Record<string, Command>>;
+}>;
 
 export interface CustomClusters {
-    [k: string]: ClusterDefinition;
+    [k: string]: Cluster;
 }
 
 export type ClusterName =
@@ -237,12 +326,18 @@ export type ClusterName =
     | "genMultistateOutput"
     | "genMultistateValue"
     | "genCommissioning"
+    | "piPartition"
     | "genOta"
+    | "powerProfile"
+    | "haApplianceControl"
+    | "pulseWidthModulation"
     | "genPollCtrl"
     | "greenPower"
     | "mobileDeviceCfg"
     | "neighborCleaning"
     | "nearestGateway"
+    | "keepAlive"
+    | "zigbeeDirectConfiguration"
     | "closuresShadeCfg"
     | "closuresDoorLock"
     | "closuresWindowCovering"
@@ -298,8 +393,6 @@ export type ClusterName =
     | "msSodium"
     | "pm25Measurement"
     | "msFormaldehyde"
-    | "pm1Measurement"
-    | "pm10Measurement"
     | "ssIasZone"
     | "ssIasAce"
     | "ssIasWd"
@@ -325,50 +418,18 @@ export type ClusterName =
     | "piMultistateValueExt"
     | "pi11073ProtocolTunnel"
     | "piIso7818ProtocolTunnel"
-    | "piRetailTunnel"
+    | "retailTunnel"
     | "seMetering"
-    | "tunneling"
+    | "seTunneling"
     | "telecommunicationsInformation"
     | "telecommunicationsVoiceOverZigbee"
     | "telecommunicationsChatting"
     | "haApplianceIdentification"
-    | "haMeterIdentification"
+    | "seMeterIdentification"
     | "haApplianceEventsAlerts"
     | "haApplianceStatistics"
     | "haElectricalMeasurement"
     | "haDiagnostic"
     | "touchlink"
-    | "manuSpecificClusterAduroSmart"
-    | "manuSpecificOsram"
-    | "manuSpecificPhilips"
-    | "manuSpecificPhilips2"
-    | "manuSpecificSinope"
-    | "manuSpecificLegrandDevices"
-    | "manuSpecificLegrandDevices2"
-    | "manuSpecificLegrandDevices3"
-    | "wiserDeviceInfo"
     | "manuSpecificTuya"
-    | "manuSpecificLumi"
-    | "liXeePrivate"
-    | "manuSpecificTuya2"
-    | "manuSpecificTuya3"
-    | "manuSpecificCentraliteHumidity"
-    | "manuSpecificSmartThingsArrivalSensor"
-    | "manuSpecificSamsungAccelerometer"
-    | "tradfriButton"
-    | "schneiderSpecificPilotMode"
-    | "elkoOccupancySettingClusterServer"
-    | "elkoSwitchConfigurationClusterServer"
-    | "manuSpecificSchneiderLightSwitchConfiguration"
-    | "manuSpecificSchneiderFanSwitchConfiguration"
-    | "sprutVoc"
-    | "sprutNoise"
-    | "sprutIrBlaster"
-    | "manuSpecificSiglisZigfred"
-    | "owonClearMetering"
-    | "zosungIRTransmit"
-    | "zosungIRControl"
-    | "manuSpecificAssaDoorLock"
-    | "manuSpecificDoorman"
-    | "manuSpecificProfalux1"
     | "manuSpecificAmazonWWAH";

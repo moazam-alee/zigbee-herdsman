@@ -34,7 +34,7 @@ let adapter: Adapter;
 const makeController = () => {
     controller = new Controller({
         network: NETWORK_OPTIONS,
-        serialPort: {
+        transport: {
             baudRate: 115200,
             rtscts: false,
             path: "/dev/ttyDummy0",
@@ -59,12 +59,13 @@ const makeController = () => {
         const db = dbOpen(path);
         // no-op
         db.write = () => {};
+        db.update = () => {};
 
         return db;
     };
     const adapterCreate = Adapter.create;
-    Adapter.create = async (networkOptions, serialPortOptions, backupPath, adapterOptions) => {
-        adapter = await adapterCreate(networkOptions, serialPortOptions, backupPath, adapterOptions);
+    Adapter.create = async (networkOptions, transportOptions, backupPath, adapterOptions) => {
+        adapter = await adapterCreate(networkOptions, transportOptions, backupPath, adapterOptions);
         adapter.start = async () => await Promise.resolve("resumed");
         adapter.getCoordinatorIEEE = async () => await Promise.resolve(COORD_IEEE);
         adapter.getNetworkParameters = async () =>
